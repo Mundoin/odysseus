@@ -4665,3 +4665,320 @@ async def do_vault_unlock(content: str, owner: Optional[str] = None) -> Dict:
         pass
 
     return {"output": "Vault unlocked. Session saved.", "exit_code": 0}
+
+
+async def do_browser_operator_safe_fill(
+    content: str,
+    owner: Optional[str] = None,
+    session_id: Optional[str] = None,
+) -> Dict:
+    """Fill safe non-sensitive form fields on the current browser page.
+
+    Two-phase: first call without ``confirmed`` returns a redacted preview.
+    Re-call with ``confirmed=true`` to execute fills via the browser MCP.
+    """
+    from src.browser_operator import (
+        build_safe_browser_fill_calls,
+        build_safe_fill_execution_report,
+        confirmation_preview_for_event,
+        execute_safe_browser_fill_batch,
+        merge_safe_fill_verification,
+        browser_action_scope,
+        record_browser_pending_action,
+        consume_browser_pending_action,
+        browser_action_fingerprint,
+        is_browser_mcp_tool_name,
+    )
+
+    try:
+        args = _parse_tool_args(content)
+    except ValueError:
+        return {"error": "Invalid JSON arguments", "exit_code": 1}
+
+    if not isinstance(args, dict):
+        return {"error": "Arguments must be a JSON object", "exit_code": 1}
+
+    page_url = args.get("page_url", "")
+    known_values = args.get("known_values", {}) or {}
+    form_fill_plan = args.get("form_fill_plan", None)
+    fields_to_fill = args.get("fields_to_fill", None)
+    confirmed = args.get("confirmed", False)
+    batch_size = int(args.get("batch_size", 3) or 3)
+
+    if not page_url:
+        return {"error": "page_url is required", "exit_code": 1}
+    if not known_values or not isinstance(known_values, dict):
+        return {"error": "known_values must be a non-empty object", "exit_code": 1}
+
+    # Build a minimal form-fill plan if one was not provided
+    if not form_fill_plan:
+        fill_steps = []
+        for key, val in known_values.items():
+            if val is None or val == "":
+                continue
+            fill_steps.append({
+                "field_ref": key,
+                "label": key,
+                "name": key,
+                "field_type": "text",
+                "direction": "fill",
+                "confidence": "high",
+                "safe_to_fill": True,
+                "value_preview_redacted": str(val)[:3] + "..." if len(str(val)) > 3 else str(val),
+                "value_source": f"known_values.{key}",
+            })
+        form_fill_plan = {
+            "page_url": page_url,
+            "page_title": page_url,
+            "fill_steps": fill_steps,
+            "safe_fill_count": len(fill_steps),
+            "skipped": [],
+            "blocked_actions": [],
+            "upload_steps": [],
+            "missing_values": [],
+            "sensitive_values": [],
+        }
+
+    # Get MCP manager
+    mcp = None
+    try:
+        mcp = get_mcp_manager()
+    except Exception:
+        pass
+
+    # Phase 1: Preview (no confirmed)
+    if not confirmed:
+        bridge = build_safe_browser_fill_calls(
+            form_fill_plan,
+            known_values,
+            batch_size=batch_size,
+            fill_tool_name=None,
+            snapshot_tool_name=None,
+            mcp_mgr=mcp,
+        )
+
+        tool_name = "browser_operator_safe_fill"
+        fill_args_for_fingerprint = {
+            "page_url": page_url,
+            "known_values_keys": sorted(known_values.keys()),
+            "batch_size": batch_size,
+        }
+
+        # Strip raw values from the preview batches before returning
+        _safe_batches = []
+        for _batch in bridge.get("batches", []):
+            _safe_batch = []
+            for _call in _batch:
+                _safe_call = dict(_call)
+                _safe_args = dict(_safe_call.get("args", {}))
+                _safe_args.pop("value", None)
+                _safe_call["args"] = _safe_args
+                _safe_call.pop("value", None)
+                _safe_batch.append(_safe_call)
+            _safe_batches.append(_safe_batch)
+
+        preview = {
+            "pending_confirmation": True,
+            "tool_name": tool_name,
+            "action_name": "safe_fill",
+            "page_url": page_url,
+            "target": page_url,
+            "fields": _safe_batches,
+            "public_calls": bridge.get("public_calls", []),
+            "skipped": bridge.get("skipped", []),
+            "blocked_actions": bridge.get("blocked_actions", []),
+            "safe_fill_count": bridge.get("safe_fill_count", 0),
+            "sensitive_skipped": bridge.get("sensitive_skipped", 0),
+            "redacted_value_objects": bridge.get("redacted_value_objects", {}),
+            "batch_size": batch_size,
+            "requires_review": True,
+            "instruction": "Review the redacted preview above. Call this tool again with confirmed=true to execute.",
+            "raw_value_policy": "Raw values are used only for immediate browser fill dispatch and are not persisted in public output or history.",
+        }
+
+        scope = browser_action_scope(session_id=session_id, owner=owner)
+        enriched = record_browser_pending_action(
+            scope,
+            tool_name,
+            fill_args_for_fingerprint,
+            preview,
+        )
+        # Redact sensitive fields for the output
+        safe = confirmation_preview_for_event(enriched)
+        return safe
+
+    # Phase 2: Execute (confirmed=true)
+    tool_name = "browser_operator_safe_fill"
+    fill_args_for_fingerprint = {
+        "page_url": page_url,
+        "known_values_keys": sorted(known_values.keys()),
+        "batch_size": batch_size,
+    }
+
+    scope = browser_action_scope(session_id=session_id, owner=owner)
+    if not consume_browser_pending_action(scope, tool_name, fill_args_for_fingerprint):
+        # No matching pending action — someone changed the request or this is
+        # a new session. Return a preview so the user can re-approve.
+        bridge = build_safe_browser_fill_calls(
+            form_fill_plan,
+            known_values,
+            batch_size=batch_size,
+            fill_tool_name=None,
+            snapshot_tool_name=None,
+            mcp_mgr=mcp,
+        )
+        # Also sanitize batches for mismatch preview
+        _safe_batches = []
+        for _batch in bridge.get("batches", []):
+            _safe_batch = []
+            for _call in _batch:
+                _safe_call = dict(_call)
+                _safe_args = dict(_safe_call.get("args", {}))
+                _safe_args.pop("value", None)
+                _safe_call["args"] = _safe_args
+                _safe_call.pop("value", None)
+                _safe_batch.append(_safe_call)
+            _safe_batches.append(_safe_batch)
+
+        preview = {
+            "pending_confirmation": True,
+            "tool_name": tool_name,
+            "action_name": "safe_fill",
+            "page_url": page_url,
+            "target": page_url,
+            "approval_mismatch": True,
+            "message": "The fill request changed since approval. Please review the updated preview and approve again.",
+            "fields": _safe_batches,
+            "skipped": bridge.get("skipped", []),
+            "blocked_actions": bridge.get("blocked_actions", []),
+            "safe_fill_count": bridge.get("safe_fill_count", 0),
+        }
+        scope = browser_action_scope(session_id=session_id, owner=owner)
+        enriched = record_browser_pending_action(scope, tool_name, fill_args_for_fingerprint, preview)
+        return confirmation_preview_for_event(enriched)
+
+    # Check that we have a browser MCP with fill tools
+    if not mcp:
+        return {
+            "error": "Browser fill backend unavailable",
+            "diagnostic": {
+                "browser_snapshot_available": False,
+                "browser_fill_tool_available": False,
+                "mcp_server_name": None,
+                "missing_tool_names": ["browser_fill", "browser_type", "browser_select_option"],
+            },
+            "suggestion": "Connect a browser MCP server (e.g., @playwright/mcp) and restart Odysseus.",
+        }
+
+    try:
+        all_mcp_tools = mcp.get_all_tools()
+    except Exception:
+        all_mcp_tools = []
+
+    browser_tools = [t for t in all_mcp_tools if is_browser_mcp_tool_name(t.get("name", ""))]
+    fill_tool_available = any(
+        t.get("name", "").endswith(("_fill", "_type", "_select_option"))
+        for t in browser_tools
+    )
+    snapshot_available = any(
+        t.get("name", "").endswith("_snapshot")
+        for t in browser_tools
+    )
+
+    if not fill_tool_available or not browser_tools:
+        missing = []
+        if not snapshot_available:
+            missing.append("browser_snapshot")
+        if not fill_tool_available:
+            missing.append("browser_fill")
+            missing.append("browser_type")
+            missing.append("browser_select_option")
+
+        server_name = None
+        for t in all_mcp_tools:
+            if t.get("server_name"):
+                server_name = t["server_name"]
+                break
+
+        return {
+            "error": "Browser fill backend unavailable",
+            "diagnostic": {
+                "browser_snapshot_available": snapshot_available,
+                "browser_fill_tool_available": fill_tool_available,
+                "mcp_server_name": server_name,
+                "missing_tool_names": missing,
+                "exposed_browser_tools": [t.get("name", "") for t in browser_tools],
+                "total_mcp_tools": len(all_mcp_tools),
+            },
+            "suggestion": "Install and connect a Playwright MCP server with full browser tool support.",
+        }
+
+    # Build fill calls with tool name discovery
+    bridge = build_safe_browser_fill_calls(
+        form_fill_plan,
+        known_values,
+        batch_size=batch_size,
+        fill_tool_name=None,
+        snapshot_tool_name=None,
+        mcp_mgr=mcp,
+    )
+
+    batches = bridge.get("batches", [])
+    if not batches:
+        return {
+            "output": "No safe fill fields to execute. All fields were skipped or blocked.",
+            "skipped": bridge.get("skipped", []),
+            "blocked_actions": bridge.get("blocked_actions", []),
+            "exit_code": 0,
+        }
+
+    # Execute each batch
+    all_calls = []
+    all_skipped = list(bridge.get("skipped", []))
+    all_blocked = list(bridge.get("blocked_actions", []))
+    succeeded = 0
+    failed = 0
+    unknown = 0
+
+    for batch in batches:
+        try:
+            report = await execute_safe_browser_fill_batch(
+                mcp,
+                batch,
+                snapshot_tool_name=bridge.get("snapshot_tool_name", "mcp__builtin_browser__browser_snapshot"),
+            )
+            all_calls.extend(report.get("filled", []))
+            all_skipped.extend(report.get("skipped", []))
+            succeeded += report.get("succeeded_count", 0)
+            failed += report.get("failed_count", 0)
+            unknown += report.get("unknown_count", 0)
+        except Exception as exc:
+            logger.warning("[browser_operator_safe_fill] Batch execution failed: %s", exc)
+            for call in batch:
+                all_calls.append({
+                    "field_ref": call.get("field_ref", ""),
+                    "label": call.get("label", ""),
+                    "name": call.get("name", ""),
+                    "status": "failed",
+                    "reason": f"execution error: {exc}",
+                })
+                failed += 1
+
+    return {
+        "output": (
+            f"Safe fill completed. {succeeded} fields filled, {failed} failed, "
+            f"{unknown} could not be verified. {len(all_skipped)} skipped, "
+            f"{len(all_blocked)} blocked."
+        ),
+        "succeeded_count": succeeded,
+        "failed_count": failed,
+        "unknown_count": unknown,
+        "filled": all_calls,
+        "skipped": all_skipped,
+        "blocked_actions": all_blocked,
+        "page_url": page_url,
+        "fill_tool_name": bridge.get("fill_tool_name", ""),
+        "snapshot_tool_name": bridge.get("snapshot_tool_name", ""),
+        "raw_value_policy": "Raw values were used only for immediate browser fill dispatch and are not persisted in this output.",
+        "exit_code": 0,
+    }

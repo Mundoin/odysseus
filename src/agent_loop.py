@@ -1941,22 +1941,25 @@ async def stream_agent_loop(
     # and the model sees zero browser schemas even though the prompt says
     # "browser tools are CONNECTED and available" — the root cause of
     # inconsistent browser tool exposure (#v1-fix).
-    if "browser" in (_intent.get("domains") or set()) and mcp_mgr:
-        from src.browser_operator import is_browser_mcp_tool_name
-        try:
-            _browser_tools = {
-                t["qualified_name"] if t.get("qualified_name")
-                else f"mcp__{t['server_id']}__{t['name']}"
-                for t in mcp_mgr.get_all_tools(_mcp_disabled_map)
-                if is_browser_mcp_tool_name(t.get("name", ""))
-            }
-            _relevant_tools.update(_browser_tools)
-            logger.info(
-                "[tool-rag] Browser domain detected; pinned %d browser MCP tools",
-                len(_browser_tools),
-            )
-        except Exception as _exc:
-            logger.warning("[tool-rag] Failed to pin browser tools: %s", _exc)
+    if "browser" in (_intent.get("domains") or set()):
+        # Always include the stable browser operator tool when browser intent is detected
+        _relevant_tools.add("browser_operator_safe_fill")
+        if mcp_mgr:
+            from src.browser_operator import is_browser_mcp_tool_name
+            try:
+                _browser_tools = {
+                    t["qualified_name"] if t.get("qualified_name")
+                    else f"mcp__{t['server_id']}__{t['name']}"
+                    for t in mcp_mgr.get_all_tools(_mcp_disabled_map)
+                    if is_browser_mcp_tool_name(t.get("name", ""))
+                }
+                _relevant_tools.update(_browser_tools)
+                logger.info(
+                    "[tool-rag] Browser domain detected; pinned %d browser MCP tools + browser_operator_safe_fill",
+                    len(_browser_tools),
+                )
+            except Exception as _exc:
+                logger.warning("[tool-rag] Failed to pin browser tools: %s", _exc)
 
     # Pin browser tools across follow-up turns: if the previous assistant
     # turn used a browser MCP tool, keep them available so "current page"
@@ -1980,6 +1983,7 @@ async def stream_agent_loop(
         except Exception:
             pass
         if _browser_seen_in_context:
+            _relevant_tools.add("browser_operator_safe_fill")
             try:
                 _browser_tools = {
                     t["qualified_name"] if t.get("qualified_name")

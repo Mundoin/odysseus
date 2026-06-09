@@ -1182,6 +1182,25 @@ FUNCTION_TOOL_SCHEMAS = [
             }
         }
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_operator_safe_fill",
+            "description": "Fill safe non-sensitive text-like form fields on the current browser page. Two-phase: first call returns a redacted preview requiring user approval; re-call with confirmed=true to execute. Blocks password, file upload, payment, submit, apply, and sensitive fields. After execution, verifies filled fields with a browser snapshot and returns a redacted report. Use this for ANY form-fill intent: 'fill the form', 'type in my details', 'autofill this page', 'populate the fields', 'fill safe fields', 'fill only text fields'. Do NOT call low-level browser_fill/browser_type MCP tools directly — use this single operator tool instead.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "page_url": {"type": "string", "description": "The page URL being filled (from page inventory or snapshot)"},
+                    "known_values": {"type": "object", "description": "Flat object mapping field keys to raw values, e.g. {'email': 'user@example.com', 'city': 'Dortmund'}. Keys should match form-fill plan field labels/names."},
+                    "form_fill_plan": {"type": "object", "description": "Optional: the complete form-fill plan dict from build_form_fill_plan (page_inventory output). Pass the full plan including fill_steps, missing_values, sensitive_values, upload_steps, blocked_actions."},
+                    "fields_to_fill": {"type": "array", "items": {"type": "string"}, "description": "Optional: specific field refs/labels to fill. If omitted, fills all safe mapped fields from the plan."},
+                    "confirmed": {"type": "boolean", "description": "Set to true to execute after user approval. Omit on first call to receive a redacted preview."},
+                    "batch_size": {"type": "integer", "description": "How many fields to fill per batch before verifying (default 3)."}
+                },
+                "required": ["page_url", "known_values"]
+            }
+        }
+    },
 ]
 
 
@@ -1376,7 +1395,8 @@ def function_call_to_tool_block(name: str, arguments: str) -> Optional[ToolBlock
             content = action
     elif tool_type in ("manage_tasks", "manage_skills", "api_call",
                         "manage_endpoints", "manage_mcp", "manage_webhooks",
-                        "manage_tokens", "manage_documents", "manage_settings"):
+                        "manage_tokens", "manage_documents", "manage_settings",
+                        "browser_operator_safe_fill"):
         content = json.dumps(args)
     elif tool_type == "ask_teacher":
         content = args.get("model", "auto") + "\n" + args.get("problem", "")

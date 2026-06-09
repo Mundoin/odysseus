@@ -460,6 +460,7 @@ async def execute_tool_block(
         do_manage_mcp, do_manage_webhooks, do_manage_tokens,
         do_manage_documents, do_manage_settings, do_manage_notes,
         do_manage_calendar,
+        do_browser_operator_safe_fill,
         do_download_model, do_serve_model, do_list_served_models, do_stop_served_model,
         do_tail_serve_output,
         do_list_downloads, do_cancel_download, do_search_hf_models, do_list_cached_models,
@@ -757,6 +758,9 @@ async def execute_tool_block(
     elif tool == "edit_file":
         result = await _direct_fallback(tool, content, workspace=workspace) or {"error": "edit failed", "exit_code": 1}
         desc = result.get("output") or result.get("error") or "edit_file"
+    elif tool == "browser_operator_safe_fill":
+        desc = "browser_operator_safe_fill"
+        result = await do_browser_operator_safe_fill(content, owner=owner, session_id=session_id)
     elif tool == "trigger_research":
         desc = "trigger_research"
         result = await do_trigger_research(content, owner=owner)
