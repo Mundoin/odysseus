@@ -99,3 +99,4 @@ _scratch/
 /odysseus_backup_*.json
 /odysseus_memory_seed_proposed.json
 /start-odysseus-hidden.ps1
+/stop-odysseus.ps1
