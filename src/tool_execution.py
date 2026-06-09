@@ -24,6 +24,7 @@ from src.tool_security import is_public_blocked_tool, owner_is_admin_or_single_u
 from src.tool_policy import ToolPolicy
 from src.constants import MAX_OUTPUT_CHARS, MAX_READ_CHARS, MAX_DIFF_LINES, DATA_DIR
 from src.tool_utils import _truncate, get_mcp_manager
+from src.external_action_guard import guard_mcp as _ext_guard_mcp
 
 # Persistent working directory for agent subprocesses.
 # Resolves to <repo_root>/data, which is the bind-mounted volume in Docker
@@ -330,6 +331,10 @@ async def _call_mcp_tool(
     server_id, tool_name = _MCP_TOOL_MAP[tool]
     qualified = f"mcp__{server_id}__{tool_name}"
     args = _build_mcp_args(tool, content)
+    _confirmed = bool(args.pop("confirmed", False))
+    _block = _ext_guard_mcp(tool, args, _confirmed)
+    if _block is not None:
+        return _block
     result = await mcp.call_tool(qualified, args)
 
     # If MCP server not connected, try direct fallback
@@ -771,8 +776,13 @@ async def execute_tool_block(
                 args = json.loads(content) if content.strip().startswith("{") else {}
             except (json.JSONDecodeError, TypeError):
                 args = {}
+            _confirmed = bool(args.pop("confirmed", False))
+            _block = _ext_guard_mcp(tool, args, _confirmed)
             desc = f"mcp: {tool}"
-            result = await mcp.call_tool(tool, args)
+            if _block is not None:
+                result = _block
+            else:
+                result = await mcp.call_tool(tool, args)
         else:
             desc = f"mcp: {tool}"
             result = {"error": "MCP manager not available", "exit_code": 1}

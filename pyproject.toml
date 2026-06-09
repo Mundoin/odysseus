@@ -22,4 +22,5 @@ markers = [
     "sub_email_tool_exposure: email tool schema visibility and model classification tests",
     "sub_tool_list: final tool-schema list correctness tests",
     "sub_external_action_guards: api_call / app_api external-action confirmation gate tests",
+    "sub_mcp_dispatch_guards: MCP dispatch layer external-action confirmation gate tests",
 ]
