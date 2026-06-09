@@ -88,5 +88,14 @@ docs/windows-port/
 # Local config
 compound.config.json
 *.error.log
-_scratch/
+_scratch_
 /odysseus/
+
+# AgentOps session artifacts
+/.agents/
+
+# Local Odysseus/private artifacts
+/memory/
+/odysseus_backup_*.json
+/odysseus_memory_seed_proposed.json
+/start-odysseus-hidden.ps1
