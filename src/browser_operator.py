@@ -14,6 +14,7 @@ BROWSER_OPERATOR_RULES = """\
 - For browser tasks, first inspect the page with safe read tools such as snapshot, screenshot, console/network inspection, or navigation when needed.
 - Summarize what you see for the user: page title/URL if available, visible purpose, important fields/buttons/links, safe next actions, and risky actions that need approval.
 - Drafting/preparing fields is allowed when the tool is a local prepare action. Do not submit, send, upload, buy, cancel, refund, return, delete, change account/settings/security/payment/tax/legal/admin state, or run page code without current-chat approval.
+- When filling forms, fill only safe non-sensitive text-like fields, work in small batches, verify with a fresh observation after each batch, stop before upload/submit/apply/payment/send, and report what changed or could not be verified.
 - If a browser action returns `pending_confirmation`, show the preview to the user and wait. Only after explicit current-chat approval should you retry the same MCP tool with `confirmed=true` and the same action arguments.
 - After a confirmed browser action, report what happened from the tool result; do not claim success if the browser/MCP tool failed or was unavailable."""
 
@@ -841,6 +842,259 @@ def format_form_fill_plan(plan: dict[str, Any]) -> str:
     lines.extend(_format_plan_list(
         "Next safe actions:",
         plan.get("next_safe_actions") or [],
+        ("action", "target", "reason"),
+    ))
+    return "\n".join(lines)
+
+
+_SAFE_FILL_FIELD_TYPES = {
+    "text", "email", "tel", "telephone", "url", "search", "textarea",
+    "select", "select-one", "select-multiple",
+}
+_ACCEPTABLE_FILL_CONFIDENCE = {"high", "medium"}
+
+
+def _is_explicitly_safe_private_step(step: dict[str, Any]) -> bool:
+    return bool(step.get("explicitly_safe") or step.get("explicit_user_safe"))
+
+
+def _safe_fill_skip_reason(step: dict[str, Any]) -> str | None:
+    if step.get("safe_to_fill") is not True:
+        return "planner did not mark this step safe to fill"
+    if not step.get("value_preview_redacted"):
+        return "no value preview is available for this field"
+    confidence = str(step.get("confidence") or "").lower()
+    if confidence not in _ACCEPTABLE_FILL_CONFIDENCE:
+        return f"fill confidence '{confidence or 'unknown'}' is below the safe threshold"
+    field_type = str(step.get("field_type") or "unknown").lower()
+    if field_type not in _SAFE_FILL_FIELD_TYPES:
+        return f"field type '{field_type}' is not in the safe text-like allowlist"
+    identity = _field_identity({
+        "label": step.get("label", ""),
+        "name": step.get("name", ""),
+        "id": step.get("id", ""),
+        "type": field_type,
+        "candidate_meaning": step.get("reason", ""),
+    })
+    if "private message" in identity and not _is_explicitly_safe_private_step(step):
+        return "private-message fields require an explicit safe marker before filling"
+    sensitive, reason = _is_sensitive_form_field({
+        "label": step.get("label", ""),
+        "name": step.get("name", ""),
+        "id": step.get("id", ""),
+        "type": field_type,
+        "candidate_meaning": step.get("reason", ""),
+    })
+    if sensitive:
+        return reason or "sensitive field"
+    return None
+
+
+def _execution_step(step: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "field_ref": step.get("field_ref", ""),
+        "label": step.get("label", ""),
+        "name": step.get("name", ""),
+        "id": step.get("id", ""),
+        "field_type": step.get("field_type", "unknown"),
+        "value_preview_redacted": step.get("value_preview_redacted", ""),
+        "confidence": step.get("confidence", "unknown"),
+        "safe_to_fill": True,
+        "reason": step.get("reason", "safe mapped fill step"),
+        "suggested_tool": "browser_fill",
+        "verification": "request browser snapshot after this batch and compare redacted visible value",
+    }
+
+
+def build_safe_fill_execution_steps(
+    form_fill_plan: dict[str, Any],
+    batch_size: int = 3,
+) -> dict[str, Any]:
+    """Select safe fill steps and group them into small verification batches."""
+    batch_size = max(1, int(batch_size or 1))
+    steps: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for step in form_fill_plan.get("fill_steps") or []:
+        reason = _safe_fill_skip_reason(step)
+        if reason:
+            skipped.append({
+                "field_ref": step.get("field_ref", ""),
+                "label": step.get("label", ""),
+                "name": step.get("name", ""),
+                "id": step.get("id", ""),
+                "reason": reason,
+            })
+        else:
+            steps.append(_execution_step(step))
+
+    batches = [steps[index:index + batch_size] for index in range(0, len(steps), batch_size)]
+    blocked_actions = [
+        {
+            "action": "upload",
+            "target": upload.get("field_ref") or upload.get("label") or upload.get("name", ""),
+            "reason": upload.get("reason", "upload requires approval"),
+            "requires_approval": True,
+        }
+        for upload in (form_fill_plan.get("upload_steps") or [])
+    ]
+    blocked_actions.extend({
+        "action": action.get("action", "action"),
+        "target": action.get("target", ""),
+        "reason": action.get("reason", "risky action requires approval"),
+        "requires_approval": True,
+    } for action in (form_fill_plan.get("blocked_actions") or []))
+
+    next_required = list(form_fill_plan.get("missing_values") or [])
+    next_required.extend(form_fill_plan.get("sensitive_values") or [])
+    next_safe = [
+        {"action": "fill_batch", "target": f"batch_{index + 1}", "reason": "safe text-like fields selected"}
+        for index, _batch in enumerate(batches)
+    ]
+    if steps:
+        next_safe.append({"action": "review_page", "target": form_fill_plan.get("page_url", ""), "reason": "verify values after filling"})
+
+    return {
+        "page_url": form_fill_plan.get("page_url", ""),
+        "page_title": form_fill_plan.get("page_title", ""),
+        "batch_size": batch_size,
+        "steps": steps,
+        "batches": batches,
+        "skipped": skipped,
+        "blocked_actions": blocked_actions,
+        "next_required_user_inputs": next_required,
+        "next_safe_actions": next_safe,
+        "requires_review": bool(steps or skipped or blocked_actions or next_required),
+        "real_execution_wired": False,
+        "execution_bridge_note": (
+            "This plan is ready for existing browser_fill/browser_type MCP tools, "
+            "but direct execution requires the agent/tool caller to pass raw values; "
+            "the planner stores only redacted previews."
+        ),
+    }
+
+
+def format_safe_fill_execution_plan(execution: dict[str, Any]) -> str:
+    lines = [
+        "Safe fill execution plan",
+        f"- Page title: {execution.get('page_title') or 'unknown'}",
+        f"- Page URL: {execution.get('page_url') or 'unknown'}",
+        f"- Batch size: {execution.get('batch_size')}",
+        f"- Real browser execution wired: {execution.get('real_execution_wired')}",
+        f"- Bridge note: {execution.get('execution_bridge_note')}",
+    ]
+    lines.append("Batches:")
+    if not execution.get("batches"):
+        lines.append("- None.")
+    for index, batch in enumerate(execution.get("batches") or [], start=1):
+        refs = ", ".join(step.get("field_ref", "") for step in batch)
+        lines.append(f"- Batch {index}: {refs}")
+    lines.extend(_format_plan_list(
+        "Selected safe fill steps:",
+        execution.get("steps") or [],
+        ("field_ref", "label", "name", "field_type", "value_preview_redacted", "confidence", "suggested_tool"),
+    ))
+    lines.extend(_format_plan_list(
+        "Skipped fill steps:",
+        execution.get("skipped") or [],
+        ("field_ref", "label", "name", "reason"),
+    ))
+    lines.extend(_format_plan_list(
+        "Blocked actions still requiring approval:",
+        execution.get("blocked_actions") or [],
+        ("action", "target", "reason", "requires_approval"),
+    ))
+    lines.extend(_format_plan_list(
+        "Next required user inputs:",
+        execution.get("next_required_user_inputs") or [],
+        ("field_ref", "label", "name", "question_for_user", "reason"),
+    ))
+    return "\n".join(lines)
+
+
+def build_safe_fill_execution_report(
+    execution: dict[str, Any],
+    verification_results: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Build a verification report; unverified fields are unknown, not success."""
+    verification_results = verification_results or {}
+    filled: list[dict[str, Any]] = []
+    counts = {"succeeded": 0, "failed": 0, "unknown": 0, "skipped": len(execution.get("skipped") or [])}
+    for step in execution.get("steps") or []:
+        ref = step.get("field_ref", "")
+        verification = verification_results.get(ref) or {}
+        status = str(verification.get("status") or "unknown").lower()
+        if status not in {"succeeded", "failed", "unknown", "skipped"}:
+            status = "unknown"
+        counts[status] = counts.get(status, 0) + 1
+        filled.append({
+            "field_ref": ref,
+            "label": step.get("label", ""),
+            "name": step.get("name", ""),
+            "id": step.get("id", ""),
+            "value_preview_redacted": step.get("value_preview_redacted", ""),
+            "status": status,
+            "reason": verification.get("reason") or "verification could not determine whether the value landed",
+        })
+
+    attempted_count = len(execution.get("steps") or [])
+    requires_review = bool(
+        counts.get("failed", 0)
+        or counts.get("unknown", 0)
+        or execution.get("skipped")
+        or execution.get("blocked_actions")
+        or execution.get("next_required_user_inputs")
+    )
+    return {
+        "page_url": execution.get("page_url", ""),
+        "page_title": execution.get("page_title", ""),
+        "attempted_count": attempted_count,
+        "succeeded_count": counts.get("succeeded", 0),
+        "failed_count": counts.get("failed", 0),
+        "unknown_count": counts.get("unknown", 0),
+        "skipped_count": counts.get("skipped", 0),
+        "filled": filled,
+        "skipped": execution.get("skipped") or [],
+        "blocked_actions": execution.get("blocked_actions") or [],
+        "next_required_user_inputs": execution.get("next_required_user_inputs") or [],
+        "next_safe_actions": execution.get("next_safe_actions") or [],
+        "requires_review": requires_review,
+    }
+
+
+def format_safe_fill_execution_report(report: dict[str, Any]) -> str:
+    lines = [
+        "Safe fill execution report",
+        f"- Page title: {report.get('page_title') or 'unknown'}",
+        f"- Page URL: {report.get('page_url') or 'unknown'}",
+        f"- Attempted/succeeded/failed/unknown/skipped: "
+        f"{report.get('attempted_count', 0)}/{report.get('succeeded_count', 0)}/"
+        f"{report.get('failed_count', 0)}/{report.get('unknown_count', 0)}/"
+        f"{report.get('skipped_count', 0)}",
+        f"- Requires review: {report.get('requires_review')}",
+    ]
+    lines.extend(_format_plan_list(
+        "Filled/attempted fields:",
+        report.get("filled") or [],
+        ("field_ref", "label", "name", "value_preview_redacted", "status", "reason"),
+    ))
+    lines.extend(_format_plan_list(
+        "Skipped fields:",
+        report.get("skipped") or [],
+        ("field_ref", "label", "name", "reason"),
+    ))
+    lines.extend(_format_plan_list(
+        "Blocked actions still requiring approval:",
+        report.get("blocked_actions") or [],
+        ("action", "target", "reason", "requires_approval"),
+    ))
+    lines.extend(_format_plan_list(
+        "Next required user inputs:",
+        report.get("next_required_user_inputs") or [],
+        ("field_ref", "label", "name", "question_for_user", "reason"),
+    ))
+    lines.extend(_format_plan_list(
+        "Next safe actions:",
+        report.get("next_safe_actions") or [],
         ("action", "target", "reason"),
     ))
     return "\n".join(lines)

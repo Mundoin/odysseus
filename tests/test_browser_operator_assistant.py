@@ -612,3 +612,172 @@ def test_format_form_fill_plan_includes_all_operator_sections():
     assert "Upload steps requiring approval:" in text
     assert "Blocked submit/payment/send/apply actions:" in text
     assert "Next safe actions:" in text
+
+
+def test_safe_fill_execution_steps_select_only_safe_fill_steps():
+    from src.browser_operator import build_safe_fill_execution_steps
+
+    plan = {
+        "page_url": "https://jobs.example.test/apply",
+        "page_title": "Apply",
+        "fill_steps": [
+            {
+                "field_ref": "email",
+                "label": "Email",
+                "name": "email",
+                "field_type": "email",
+                "value_preview_redacted": "bujar@example.test",
+                "confidence": "high",
+                "safe_to_fill": True,
+                "reason": "mapped",
+            },
+            {
+                "field_ref": "password",
+                "label": "Password",
+                "name": "password",
+                "field_type": "password",
+                "value_preview_redacted": "[REDACTED]",
+                "confidence": "high",
+                "safe_to_fill": True,
+                "reason": "mapped",
+            },
+            {
+                "field_ref": "city",
+                "label": "City",
+                "name": "city",
+                "field_type": "text",
+                "value_preview_redacted": "",
+                "confidence": "high",
+                "safe_to_fill": True,
+                "reason": "empty",
+            },
+        ],
+    }
+
+    execution = build_safe_fill_execution_steps(plan)
+
+    assert [step["field_ref"] for step in execution["steps"]] == ["email"]
+    assert {item["field_ref"] for item in execution["skipped"]} == {"password", "city"}
+
+
+def test_safe_fill_execution_batches_are_limited():
+    from src.browser_operator import build_safe_fill_execution_steps
+
+    plan = {
+        "fill_steps": [
+            {
+                "field_ref": f"field-{index}",
+                "label": f"Field {index}",
+                "field_type": "text",
+                "value_preview_redacted": f"value {index}",
+                "confidence": "high",
+                "safe_to_fill": True,
+                "reason": "mapped",
+            }
+            for index in range(5)
+        ]
+    }
+
+    execution = build_safe_fill_execution_steps(plan, batch_size=2)
+
+    assert [len(batch) for batch in execution["batches"]] == [2, 2, 1]
+
+
+def test_safe_fill_execution_keeps_upload_and_submit_actions_blocked():
+    from src.browser_operator import build_safe_fill_execution_steps
+
+    plan = {
+        "fill_steps": [],
+        "upload_steps": [
+            {
+                "field_ref": "cv",
+                "label": "CV upload",
+                "requires_approval": True,
+                "reason": "file upload",
+            }
+        ],
+        "blocked_actions": [
+            {
+                "action": "click",
+                "target": "Apply now",
+                "requires_approval": True,
+                "reason": "button classified as risky",
+            }
+        ],
+    }
+
+    execution = build_safe_fill_execution_steps(plan)
+
+    assert {action["action"] for action in execution["blocked_actions"]} == {"upload", "click"}
+    assert all(action["requires_approval"] is True for action in execution["blocked_actions"])
+
+
+def test_safe_fill_execution_report_tracks_statuses_and_unknown_is_not_success():
+    from src.browser_operator import build_safe_fill_execution_report
+
+    execution = {
+        "page_url": "https://jobs.example.test/apply",
+        "page_title": "Apply",
+        "steps": [
+            {"field_ref": "email", "label": "Email", "value_preview_redacted": "bujar@example.test"},
+            {"field_ref": "city", "label": "City", "value_preview_redacted": "Berlin"},
+            {"field_ref": "phone", "label": "Phone", "value_preview_redacted": "+49 30"},
+        ],
+        "skipped": [{"field_ref": "password", "reason": "sensitive field"}],
+        "blocked_actions": [{"action": "click", "target": "Apply now", "requires_approval": True}],
+        "next_required_user_inputs": [{"field_ref": "availability", "question_for_user": "When can you start?"}],
+    }
+    verification = {
+        "email": {"status": "succeeded", "reason": "value visible"},
+        "city": {"status": "failed", "reason": "field stayed empty"},
+    }
+
+    report = build_safe_fill_execution_report(execution, verification)
+
+    assert report["attempted_count"] == 3
+    assert report["succeeded_count"] == 1
+    assert report["failed_count"] == 1
+    assert report["unknown_count"] == 1
+    assert report["skipped_count"] == 1
+    assert report["requires_review"] is True
+    assert report["filled"][2]["status"] == "unknown"
+
+
+def test_format_safe_fill_execution_plan_and_report_show_operator_sections():
+    from src.browser_operator import (
+        build_safe_fill_execution_report,
+        build_safe_fill_execution_steps,
+        format_safe_fill_execution_plan,
+        format_safe_fill_execution_report,
+    )
+
+    form_plan = {
+        "fill_steps": [
+            {
+                "field_ref": "email",
+                "label": "Email",
+                "field_type": "email",
+                "value_preview_redacted": "bujar@example.test",
+                "confidence": "high",
+                "safe_to_fill": True,
+                "reason": "mapped",
+            }
+        ],
+        "missing_values": [{"field_ref": "city", "question_for_user": "City?"}],
+        "blocked_actions": [{"action": "click", "target": "Apply now", "requires_approval": True}],
+    }
+    execution = build_safe_fill_execution_steps(form_plan)
+    report = build_safe_fill_execution_report(execution, {"email": {"status": "unknown", "reason": "snapshot unavailable"}})
+
+    plan_text = format_safe_fill_execution_plan(execution)
+    report_text = format_safe_fill_execution_report(report)
+
+    assert "Safe fill execution plan" in plan_text
+    assert "Batches:" in plan_text
+    assert "Skipped fill steps:" in plan_text
+    assert "Blocked actions still requiring approval:" in plan_text
+    assert "Safe fill execution report" in report_text
+    assert "Filled/attempted fields:" in report_text
+    assert "Skipped fields:" in report_text
+    assert "Next required user inputs:" in report_text
+    assert "Requires review: True" in report_text
