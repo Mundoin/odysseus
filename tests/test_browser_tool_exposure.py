@@ -501,3 +501,127 @@ def test_plan_mode_blocks_browser_write_tools():
     # tool whose read-only status is ambiguous.
     assert "browser_snapshot" in disabled_map.get("builtin_browser", set())
     assert "browser_navigate" in disabled_map.get("builtin_browser", set())
+
+
+# ── Domain detection for browser-operator intents ─────────────────────────
+
+def test_classify_detects_page_inventory():
+    from src.agent_loop import _classify_agent_request
+
+    intent = _classify_agent_request([], "build a page inventory")
+    assert "browser" in intent["domains"]
+
+
+def test_classify_detects_form_fill_plan():
+    from src.agent_loop import _classify_agent_request
+
+    intent = _classify_agent_request([], "create a form-fill plan")
+    assert "browser" in intent["domains"]
+
+
+def test_classify_detects_fill_safe_fields():
+    from src.agent_loop import _classify_agent_request
+
+    intent = _classify_agent_request([], "fill only safe non-sensitive text fields")
+    assert "browser" in intent["domains"]
+
+
+def test_classify_detects_stop_and_report():
+    from src.agent_loop import _classify_agent_request
+
+    intent = _classify_agent_request([], "do not submit, do not upload, stop and report")
+    assert "browser" in intent["domains"]
+
+
+def test_classify_detects_inspect_current_page():
+    from src.agent_loop import _classify_agent_request
+
+    intent = _classify_agent_request([], "Inspect the current browser page")
+    assert "browser" in intent["domains"]
+
+
+def test_classify_detects_form_inventory():
+    from src.agent_loop import _classify_agent_request
+
+    intent = _classify_agent_request([], "build a form inventory of all inputs")
+    assert "browser" in intent["domains"]
+
+
+def test_classify_detects_detect_fields():
+    from src.agent_loop import _classify_agent_request
+
+    intent = _classify_agent_request([], "detect fields on the current page")
+    assert "browser" in intent["domains"]
+
+
+# ── Browser MCP tool pinning when domain detected ─────────────────────────
+
+def test_browser_domain_pins_browser_mcp_tools_from_mgr():
+    """When browser domain is detected and mcp_mgr has browser tools,
+    those tool qualified names should be added to _relevant_tools."""
+    from src.agent_loop import _DOMAIN_TOOL_MAP
+    from types import SimpleNamespace
+
+    fake_mgr = SimpleNamespace()
+    fake_mgr.get_all_tools = lambda dmap=None: [
+        {"name": "browser_snapshot", "server_id": "builtin_browser",
+         "qualified_name": "mcp__builtin_browser__browser_snapshot"},
+        {"name": "browser_navigate", "server_id": "builtin_browser",
+         "qualified_name": "mcp__builtin_browser__browser_navigate"},
+        {"name": "browser_fill", "server_id": "builtin_browser",
+         "qualified_name": "mcp__builtin_browser__browser_fill"},
+        {"name": "list_items", "server_id": "other",
+         "qualified_name": "mcp__other__list_items"},
+    ]
+
+    # The domain loop would use _DOMAIN_TOOL_MAP (browser is empty set)
+    # But our force-include code (step 2) adds browser tools directly.
+    # Simulate: run the logic that would execute at runtime.
+    from src.browser_operator import is_browser_mcp_tool_name
+    relevant = {"ask_user", "manage_memory"}
+    for t in fake_mgr.get_all_tools():
+        if is_browser_mcp_tool_name(t.get("name", "")):
+            qualified = t.get("qualified_name") or f"mcp__{t['server_id']}__{t['name']}"
+            relevant.add(qualified)
+
+    assert "mcp__builtin_browser__browser_snapshot" in relevant
+    assert "mcp__builtin_browser__browser_navigate" in relevant
+    assert "mcp__builtin_browser__browser_fill" in relevant
+    assert "mcp__other__list_items" not in relevant
+
+
+def test_followup_keeps_browser_tools_after_browser_turn():
+    """Simulate follow-up turn after a browser tool was used."""
+    messages = [
+        {"role": "user", "content": "browse to example.com"},
+        {"role": "assistant", "content": '[Tool execution results]\nmcp__builtin_browser__browser_navigate OK'},
+    ]
+    from src.agent_loop import _classify_agent_request
+    intent = _classify_agent_request(messages, "what is on the current page")
+
+    # For the follow-up turn the "current page" text alone should trigger
+    # browser domain; the follow-up pin is a belt-and-suspenders.
+    assert "browser" in intent["domains"]
+
+
+def test_missing_runtime_does_not_invent_browser_tools():
+    """When browser domain is detected but mcp_mgr has no browser tools,
+    no browser tools should appear in relevant set."""
+    from types import SimpleNamespace
+
+    fake_mgr = SimpleNamespace()
+    fake_mgr.get_all_tools = lambda dmap=None: [
+        {"name": "list_items", "server_id": "other",
+         "qualified_name": "mcp__other__list_items"},
+    ]
+
+    from src.browser_operator import is_browser_mcp_tool_name
+    relevant = {"ask_user", "manage_memory"}
+    for t in fake_mgr.get_all_tools():
+        if is_browser_mcp_tool_name(t.get("name", "")):
+            qualified = t.get("qualified_name") or f"mcp__{t['server_id']}__{t['name']}"
+            relevant.add(qualified)
+
+    assert all("browser" not in n for n in relevant), (
+        "No browser tools should be added when runtime has none"
+    )

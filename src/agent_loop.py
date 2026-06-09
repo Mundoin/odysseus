@@ -622,7 +622,10 @@ _API_HOSTS = frozenset([
     "localhost", "127.0.0.1", "host.docker.internal",
 ])
 _MCP_KEYWORDS = frozenset(["mcp", "browse", "browser", "website", "calendar", "event", "email",
-                           "gmail", "screenshot", "navigate", "click", "miniflux", "rss", "feed"])
+                           "gmail", "screenshot", "navigate", "click", "miniflux", "rss", "feed",
+                           "inspect page", "page snapshot", "fill form", "fill field", "form fill",
+                           "form-fill", "browser page", "field fill", "current page", "page inventory",
+                           "form inventory", "safe field", "stop and report"])
 _ADMIN_SCHEMA_NAMES = frozenset([
     "manage_session", "manage_skills", "manage_tasks",
     "manage_endpoints", "manage_mcp", "manage_webhooks", "manage_tokens",
@@ -810,7 +813,21 @@ def _classify_agent_request(messages: List[Dict], last_user: str) -> Dict[str, o
         domains.add("files")
     if has(r"\b(endpoint|api token|mcp|webhook|preference|configure|config|setting)\b"):
         domains.add("settings")
-    if has(r"\b(browser|browse|navigate to|open browser|browser automation|browser tools|browser snapshot|page snapshot|fill form|autofill|playwright|inspect page|inspect browser|browser fill|browser click|browser type)\b"):
+    if has(
+        # Navigation & basic browser intent
+        r"\b(browser|browse|navigate to|open browser|browser automation|browser tools|"
+        r"browser snapshot|browser page|browser navigate|page snapshot|"
+        # Page inspection
+        r"inspect page|inspect browser|inspect current page|current browser page|"
+        r"current page|page inventory|buttons|links|"
+        # Form intent
+        r"fill form|fill the form|fill in form|fill out form|form fill|form-fill|"
+        r"form inventory|fill fields|fill safe|safe fields|detect fields|input fields|"
+        r"text fields|textarea|upload field|submit button|apply button|"
+        r"autofill|playwright|browser fill|browser click|browser type|"
+        # Guarded stop terms
+        r"do not submit|do not upload|stop and report)\b"
+    ):
         domains.add("browser")
 
     low_signal = not continuation and not domains
@@ -1894,6 +1911,58 @@ async def stream_agent_loop(
             _relevant_tools.update({"web_search", "web_fetch"})
         if "ui" in (_intent.get("domains") or set()):
             _relevant_tools.add("ui_control")
+
+    # Force-include browser MCP tools when browser domain is detected.
+    # _DOMAIN_TOOL_MAP["browser"] is always empty (browser tools are MCP-
+    # provided and matched by name prefix in _domain_rules_for_tools), so
+    # the general domain loop above adds nothing. Without this explicit
+    # pin, _relevant_tools has no browser tool names, the schema filter
+    # (line ~2170) strips every MCP tool whose name isn't in _relevant_tools,
+    # and the model sees zero browser schemas even though the prompt says
+    # "browser tools are CONNECTED and available" — the root cause of
+    # inconsistent browser tool exposure (#v1-fix).
+    if "browser" in (_intent.get("domains") or set()) and mcp_mgr:
+        from src.browser_operator import is_browser_mcp_tool_name
+        try:
+            _browser_tools = {
+                t["qualified_name"] if t.get("qualified_name")
+                else f"mcp__{t['server_id']}__{t['name']}"
+                for t in mcp_mgr.get_all_tools(_mcp_disabled_map)
+                if is_browser_mcp_tool_name(t.get("name", ""))
+            }
+            _relevant_tools.update(_browser_tools)
+            logger.info(
+                "[tool-rag] Browser domain detected; pinned %d browser MCP tools",
+                len(_browser_tools),
+            )
+        except Exception as _exc:
+            logger.warning("[tool-rag] Failed to pin browser tools: %s", _exc)
+
+    # Pin browser tools across follow-up turns: if the previous assistant
+    # turn used a browser MCP tool, keep them available so "current page"
+    # / "form-fill" intents don't lose access on the very next turn when
+    # the domain detection might not fire (e.g. a terse follow-up).
+    if not guide_only and _relevant_tools is not None and mcp_mgr:
+        from src.browser_operator import is_browser_mcp_tool_name
+        try:
+            for _msg in reversed(messages):
+                if _msg.get("role") == "assistant":
+                    _content = _msg.get("content", "") or ""
+                    if isinstance(_content, str) and (
+                        "browser_" in _content
+                        or "mcp__" in _content
+                    ):
+                        _browser_tools = {
+                            t["qualified_name"] if t.get("qualified_name")
+                            else f"mcp__{t['server_id']}__{t['name']}"
+                            for t in mcp_mgr.get_all_tools(_mcp_disabled_map)
+                            if is_browser_mcp_tool_name(t.get("name", ""))
+                        }
+                        _relevant_tools.update(_browser_tools)
+                        logger.info("[tool-rag] Follow-up browser pin: added %d browser tools", len(_browser_tools))
+                    break
+        except Exception as _exc:
+            logger.warning("[tool-rag] Failed follow-up browser pin: %s", _exc)
 
     # If a document is open the model needs the editing tools available
     # regardless of which selection path (RAG, keyword, caller-provided) ran
