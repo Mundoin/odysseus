@@ -88,7 +88,7 @@ docs/windows-port/
 # Local config
 compound.config.json
 *.error.log
-_scratch_
+_scratch/
 /odysseus/
 
 # AgentOps session artifacts
