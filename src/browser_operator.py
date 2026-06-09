@@ -898,6 +898,7 @@ def _execution_step(step: dict[str, Any]) -> dict[str, Any]:
         "id": step.get("id", ""),
         "field_type": step.get("field_type", "unknown"),
         "value_preview_redacted": step.get("value_preview_redacted", ""),
+        "value_source": step.get("value_source", ""),
         "confidence": step.get("confidence", "unknown"),
         "safe_to_fill": True,
         "reason": step.get("reason", "safe mapped fill step"),
@@ -971,6 +972,165 @@ def build_safe_fill_execution_steps(
             "the planner stores only redacted previews."
         ),
     }
+
+
+def _known_key_from_value_source(step: dict[str, Any]) -> str | None:
+    source = str(step.get("value_source") or "")
+    if source.startswith("known_values."):
+        return source.split(".", 1)[1]
+    return _known_value_key_for_field({
+        "label": step.get("label", ""),
+        "name": step.get("name", ""),
+        "id": step.get("id", ""),
+        "type": step.get("field_type", ""),
+        "candidate_meaning": step.get("reason", ""),
+    })
+
+
+def _safe_fill_target(step: dict[str, Any]) -> tuple[str | None, str | None]:
+    label = str(step.get("label") or "").strip()
+    name = str(step.get("name") or "").strip()
+    field_id = str(step.get("id") or "").strip()
+    field_ref = str(step.get("field_ref") or "").strip()
+    element = label or name or field_id
+    ref = field_ref or field_id or name
+    if not element and not ref:
+        return None, None
+    if ref.lower().startswith("field_") and not element:
+        return None, None
+    return element or ref, ref or element
+
+
+def _public_fill_call(call: dict[str, Any]) -> dict[str, Any]:
+    public_call = copy.deepcopy(call)
+    args = public_call.get("args") or {}
+    if "value" in args:
+        args["value"] = call.get("value_preview_redacted", "[REDACTED]")
+    public_call["args"] = args
+    return public_call
+
+
+def build_safe_browser_fill_calls(
+    form_fill_plan: dict[str, Any],
+    known_values: dict[str, Any],
+    batch_size: int = 3,
+    fill_tool_name: str = "mcp__builtin_browser__browser_fill",
+    snapshot_tool_name: str = "mcp__builtin_browser__browser_snapshot",
+) -> dict[str, Any]:
+    """Build raw MCP fill calls plus redacted public call previews."""
+    execution = build_safe_fill_execution_steps(form_fill_plan, batch_size=batch_size)
+    known_values = known_values or {}
+    calls: list[dict[str, Any]] = []
+    skipped = list(execution.get("skipped") or [])
+
+    for step in execution.get("steps") or []:
+        key = _known_key_from_value_source(step)
+        raw_value = known_values.get(key) if key else None
+        if raw_value in (None, ""):
+            skipped.append({
+                "field_ref": step.get("field_ref", ""),
+                "label": step.get("label", ""),
+                "name": step.get("name", ""),
+                "reason": "raw known value is unavailable at execution time",
+            })
+            continue
+        element, ref = _safe_fill_target(step)
+        if not element and not ref:
+            skipped.append({
+                "field_ref": step.get("field_ref", ""),
+                "label": step.get("label", ""),
+                "name": step.get("name", ""),
+                "reason": "field target is ambiguous; no stable label/name/id/ref was available",
+            })
+            continue
+        call = {
+            "tool_name": fill_tool_name,
+            "args": {
+                "element": element,
+                "ref": ref,
+                "value": raw_value,
+            },
+            "field_ref": step.get("field_ref", ""),
+            "label": step.get("label", ""),
+            "name": step.get("name", ""),
+            "id": step.get("id", ""),
+            "field_type": step.get("field_type", "unknown"),
+            "value_preview_redacted": step.get("value_preview_redacted", _value_preview(raw_value, key or "")),
+            "value_source": step.get("value_source", f"known_values.{key}" if key else ""),
+            "verification": step.get("verification", "request browser snapshot after fill"),
+        }
+        calls.append(call)
+
+    batches = [calls[index:index + max(1, int(batch_size or 1))] for index in range(0, len(calls), max(1, int(batch_size or 1)))]
+    public_calls = [_public_fill_call(call) for call in calls]
+    return {
+        "page_url": execution.get("page_url", ""),
+        "page_title": execution.get("page_title", ""),
+        "batch_size": max(1, int(batch_size or 1)),
+        "fill_tool_name": fill_tool_name,
+        "snapshot_tool_name": snapshot_tool_name,
+        "calls": calls,
+        "public_calls": public_calls,
+        "batches": batches,
+        "public_batches": [[_public_fill_call(call) for call in batch] for batch in batches],
+        "skipped": skipped,
+        "blocked_actions": execution.get("blocked_actions") or [],
+        "next_required_user_inputs": execution.get("next_required_user_inputs") or [],
+        "real_execution_wired": True,
+        "raw_value_policy": "raw values are present only in calls[].args.value for immediate MCP dispatch; public_* and reports are redacted",
+    }
+
+
+def build_safe_fill_verification_request(
+    snapshot_tool_name: str = "mcp__builtin_browser__browser_snapshot",
+) -> dict[str, Any]:
+    return {"tool_name": snapshot_tool_name, "args": {}, "reason": "verify safe fill batch with fresh browser observation"}
+
+
+def merge_safe_fill_verification(
+    execution: dict[str, Any],
+    observation_result: dict[str, Any] | Any,
+) -> dict[str, dict[str, Any]]:
+    content = redact_sensitive_text(_text_from_payload(_content_payload(observation_result)))
+    verification: dict[str, dict[str, Any]] = {}
+    for step in execution.get("steps") or execution.get("calls") or []:
+        ref = step.get("field_ref", "")
+        expected = str(step.get("value_preview_redacted") or "")
+        if expected and expected != "[REDACTED]" and expected in content:
+            verification[ref] = {"status": "succeeded", "reason": "redacted expected value appears in the latest browser observation"}
+        else:
+            verification[ref] = {"status": "unknown", "reason": "latest browser observation did not visibly confirm the redacted value"}
+    return verification
+
+
+async def execute_safe_browser_fill_batch(
+    mcp: Any,
+    batch: list[dict[str, Any]],
+    snapshot_tool_name: str = "mcp__builtin_browser__browser_snapshot",
+) -> dict[str, Any]:
+    """Execute one safe fill batch against an MCP manager and return a redacted report."""
+    execution = {
+        "steps": [
+            {
+                "field_ref": call.get("field_ref", ""),
+                "label": call.get("label", ""),
+                "name": call.get("name", ""),
+                "id": call.get("id", ""),
+                "value_preview_redacted": call.get("value_preview_redacted", ""),
+            }
+            for call in batch
+        ],
+        "skipped": [],
+        "blocked_actions": [],
+        "next_required_user_inputs": [],
+        "next_safe_actions": [{"action": "review_page", "target": "", "reason": "verify filled values"}],
+    }
+    for call in batch:
+        await mcp.call_tool(call["tool_name"], call["args"])
+    verification_request = build_safe_fill_verification_request(snapshot_tool_name)
+    snapshot = await mcp.call_tool(verification_request["tool_name"], verification_request["args"])
+    verification = merge_safe_fill_verification(execution, snapshot)
+    return build_safe_fill_execution_report(execution, verification)
 
 
 def format_safe_fill_execution_plan(execution: dict[str, Any]) -> str:

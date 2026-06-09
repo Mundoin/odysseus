@@ -781,3 +781,179 @@ def test_format_safe_fill_execution_plan_and_report_show_operator_sections():
     assert "Skipped fields:" in report_text
     assert "Next required user inputs:" in report_text
     assert "Requires review: True" in report_text
+
+
+def test_safe_browser_fill_calls_use_raw_values_but_redacted_public_shape():
+    from src.browser_operator import build_safe_browser_fill_calls
+
+    form_plan = {
+        "fill_steps": [
+            {
+                "field_ref": "email",
+                "label": "Email",
+                "name": "email",
+                "field_type": "email",
+                "value_preview_redacted": "bujar@example.test",
+                "value_source": "known_values.email",
+                "confidence": "high",
+                "safe_to_fill": True,
+                "reason": "mapped",
+            }
+        ],
+    }
+
+    bridge = build_safe_browser_fill_calls(
+        form_plan,
+        known_values={"email": "raw-bujar@example.test"},
+        fill_tool_name="mcp__builtin_browser__browser_fill",
+    )
+
+    assert bridge["calls"][0]["args"]["value"] == "raw-bujar@example.test"
+    assert bridge["public_calls"][0]["args"]["value"] == "bujar@example.test"
+    assert "raw-bujar@example.test" not in str(bridge["public_calls"])
+
+
+def test_safe_browser_fill_calls_skip_sensitive_ambiguous_and_missing_raw_values():
+    from src.browser_operator import build_safe_browser_fill_calls
+
+    form_plan = {
+        "fill_steps": [
+            {
+                "field_ref": "password",
+                "label": "Password",
+                "name": "password",
+                "field_type": "password",
+                "value_preview_redacted": "[REDACTED]",
+                "value_source": "known_values.password",
+                "confidence": "high",
+                "safe_to_fill": True,
+            },
+            {
+                "field_ref": "",
+                "label": "",
+                "name": "",
+                "field_type": "text",
+                "value_preview_redacted": "Berlin",
+                "value_source": "known_values.city",
+                "confidence": "high",
+                "safe_to_fill": True,
+            },
+            {
+                "field_ref": "email",
+                "label": "Email",
+                "name": "email",
+                "field_type": "email",
+                "value_preview_redacted": "bujar@example.test",
+                "value_source": "known_values.email",
+                "confidence": "high",
+                "safe_to_fill": True,
+            },
+        ],
+    }
+
+    bridge = build_safe_browser_fill_calls(form_plan, known_values={"password": "hunter2"})
+
+    assert bridge["calls"] == []
+    assert {item["field_ref"] for item in bridge["skipped"]} == {"password", "", "email"}
+
+
+def test_safe_browser_fill_calls_preserve_upload_and_submit_as_blocked():
+    from src.browser_operator import build_safe_browser_fill_calls
+
+    form_plan = {
+        "fill_steps": [],
+        "upload_steps": [{"field_ref": "cv", "label": "CV upload", "requires_approval": True}],
+        "blocked_actions": [{"action": "click", "target": "Apply now", "requires_approval": True}],
+    }
+
+    bridge = build_safe_browser_fill_calls(form_plan, known_values={})
+
+    assert {action["action"] for action in bridge["blocked_actions"]} == {"upload", "click"}
+    assert all(action["requires_approval"] is True for action in bridge["blocked_actions"])
+
+
+def test_safe_browser_fill_calls_enforce_batch_size():
+    from src.browser_operator import build_safe_browser_fill_calls
+
+    form_plan = {
+        "fill_steps": [
+            {
+                "field_ref": f"field-{index}",
+                "label": f"Field {index}",
+                "field_type": "text",
+                "value_preview_redacted": f"value {index}",
+                "value_source": f"known_values.field_{index}",
+                "confidence": "high",
+                "safe_to_fill": True,
+            }
+            for index in range(5)
+        ],
+    }
+    known_values = {f"field_{index}": f"raw {index}" for index in range(5)}
+
+    bridge = build_safe_browser_fill_calls(form_plan, known_values=known_values, batch_size=2)
+
+    assert [len(batch) for batch in bridge["batches"]] == [2, 2, 1]
+
+
+@pytest.mark.asyncio
+async def test_execute_safe_browser_fill_batch_calls_mcp_with_raw_values_and_reports_redacted():
+    from src.browser_operator import build_safe_browser_fill_calls, execute_safe_browser_fill_batch
+
+    form_plan = {
+        "fill_steps": [
+            {
+                "field_ref": "email",
+                "label": "Email",
+                "name": "email",
+                "field_type": "email",
+                "value_preview_redacted": "bujar@example.test",
+                "value_source": "known_values.email",
+                "confidence": "high",
+                "safe_to_fill": True,
+            }
+        ],
+    }
+    bridge = build_safe_browser_fill_calls(
+        form_plan,
+        known_values={"email": "raw-bujar@example.test"},
+        fill_tool_name="mcp__builtin_browser__browser_fill",
+        snapshot_tool_name="mcp__builtin_browser__browser_snapshot",
+    )
+    fake_mcp = _FakeMcp()
+
+    report = await execute_safe_browser_fill_batch(fake_mcp, bridge["batches"][0], snapshot_tool_name=bridge["snapshot_tool_name"])
+
+    assert fake_mcp.calls[0] == (
+        "mcp__builtin_browser__browser_fill",
+        {"element": "Email", "ref": "email", "value": "raw-bujar@example.test"},
+    )
+    assert fake_mcp.calls[1] == ("mcp__builtin_browser__browser_snapshot", {})
+    assert report["attempted_count"] == 1
+    assert report["unknown_count"] == 1
+    assert "raw-bujar@example.test" not in str(report)
+    assert "bujar@example.test" in str(report)
+
+
+def test_merge_safe_fill_verification_marks_success_and_unknown_not_success():
+    from src.browser_operator import build_safe_fill_execution_report, merge_safe_fill_verification
+
+    execution = {
+        "steps": [
+            {"field_ref": "email", "label": "Email", "value_preview_redacted": "bujar@example.test"},
+            {"field_ref": "city", "label": "City", "value_preview_redacted": "Berlin"},
+        ],
+        "skipped": [],
+        "blocked_actions": [],
+        "next_required_user_inputs": [],
+    }
+
+    verification = merge_safe_fill_verification(
+        execution,
+        {"content": "Email bujar@example.test is visible."},
+    )
+    report = build_safe_fill_execution_report(execution, verification)
+
+    assert report["succeeded_count"] == 1
+    assert report["unknown_count"] == 1
+    assert report["filled"][1]["status"] == "unknown"
