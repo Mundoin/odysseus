@@ -220,6 +220,352 @@ def _extract_action_lines(content: str) -> list[str]:
     return actions
 
 
+_RISKY_CONTROL_KEYWORDS = (
+    "submit", "send", "upload", "buy", "pay", "delete", "cancel", "refund",
+    "return", "confirm", "apply", "login", "sign in", "security", "account",
+    "payment", "legal", "admin", "checkout", "purchase", "order",
+)
+_SAFE_CONTROL_KEYWORDS = (
+    "read", "view", "search", "filter", "expand", "open", "details", "help",
+    "learn", "more", "next", "previous", "back", "close", "menu",
+)
+
+
+def _compact_text(value: Any, limit: int = 900) -> str:
+    text = redact_sensitive_text(value)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:limit]
+
+
+def _content_payload(result: dict[str, Any] | Any) -> Any:
+    if isinstance(result, dict):
+        for key in ("content", "output", "results", "snapshot", "page"):
+            if key in result and result[key] not in (None, ""):
+                return result[key]
+    return result
+
+
+def _iter_dicts(value: Any):
+    if isinstance(value, dict):
+        yield value
+        for item in value.values():
+            yield from _iter_dicts(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _iter_dicts(item)
+
+
+def _text_from_payload(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        parts: list[str] = []
+        for key in ("text", "content", "label", "name", "title", "url"):
+            if isinstance(value.get(key), str):
+                parts.append(value[key])
+        for key in ("children", "items", "nodes", "blocks"):
+            if key in value:
+                child_text = _text_from_payload(value[key])
+                if child_text:
+                    parts.append(child_text)
+        return "\n".join(parts)
+    if isinstance(value, list):
+        return "\n".join(_text_from_payload(item) for item in value)
+    return str(value) if value is not None else ""
+
+
+def _first_string(value: Any, keys: tuple[str, ...]) -> str | None:
+    if isinstance(value, dict):
+        for key in keys:
+            found = value.get(key)
+            if isinstance(found, str) and found.strip():
+                return redact_sensitive_text(found.strip())
+    for item in _iter_dicts(value):
+        for key in keys:
+            found = item.get(key)
+            if isinstance(found, str) and found.strip():
+                return redact_sensitive_text(found.strip())
+    return None
+
+
+def _as_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    return value if isinstance(value, list) else [value]
+
+
+def _split_labeled_values(text: str, label: str) -> list[str]:
+    value = _extract_labeled_line(text, label)
+    if not value:
+        return []
+    return [part.strip() for part in re.split(r"[,;|]", value) if part.strip()]
+
+
+def classify_browser_control(text: str, target: str | None = None, control_type: str | None = None) -> str:
+    haystack = " ".join(
+        part.lower()
+        for part in (text or "", target or "", control_type or "")
+        if part
+    )
+    if any(keyword in haystack for keyword in _RISKY_CONTROL_KEYWORDS):
+        return "risky"
+    if any(keyword in haystack for keyword in _SAFE_CONTROL_KEYWORDS):
+        return "safe"
+    return "unknown"
+
+
+def _required_state(value: Any) -> str:
+    if value is True:
+        return "required"
+    if value is False:
+        return "optional"
+    if isinstance(value, str):
+        lowered = value.lower()
+        if lowered in ("required", "true", "yes"):
+            return "required"
+        if lowered in ("optional", "false", "no"):
+            return "optional"
+    return "unknown"
+
+
+def _candidate_meaning(label: str, name: str, field_type: str) -> str:
+    text = " ".join((label, name, field_type)).lower()
+    if "email" in text:
+        return "email address"
+    if "password" in text:
+        return "password or secret"
+    if "search" in text or name == "q":
+        return "search query"
+    if "card" in text or "payment" in text:
+        return "payment data"
+    if "message" in text:
+        return "message text"
+    if "file" in text or "upload" in text:
+        return "file upload"
+    return "unknown"
+
+
+def _normalise_link(item: Any) -> dict[str, Any]:
+    if isinstance(item, dict):
+        text = item.get("text") or item.get("label") or item.get("name") or item.get("title") or item.get("href") or item.get("url") or ""
+        target = item.get("href") or item.get("target") or item.get("url")
+    else:
+        text = str(item)
+        target = None
+    text = redact_sensitive_text(text)
+    target = redact_sensitive_text(target) if target else None
+    classification = classify_browser_control(text, target, "link")
+    return {"text": text, "href": target, "classification": classification}
+
+
+def _normalise_button(item: Any) -> dict[str, Any]:
+    if isinstance(item, dict):
+        text = item.get("text") or item.get("label") or item.get("name") or item.get("title") or item.get("value") or ""
+        role = item.get("role") or "button"
+        control_type = item.get("type") or role
+    else:
+        text = str(item)
+        role = "button"
+        control_type = "button"
+    text = redact_sensitive_text(text)
+    control_type = redact_sensitive_text(control_type)
+    classification = classify_browser_control(text, None, control_type)
+    return {
+        "text": text,
+        "label": text,
+        "role": role,
+        "type": control_type,
+        "classification": classification,
+    }
+
+
+def _normalise_field(item: Any) -> dict[str, Any]:
+    item = item if isinstance(item, dict) else {"label": str(item)}
+    label = redact_sensitive_text(item.get("label") or item.get("text") or item.get("name") or "")
+    name = redact_sensitive_text(item.get("name") or "")
+    field_id = redact_sensitive_text(item.get("id") or "")
+    field_type = redact_sensitive_text(item.get("type") or item.get("input_type") or "unknown")
+    raw_value = item.get("value") or item.get("current_value") or ""
+    key_hint = name or label or field_type
+    redacted_value = redact_sensitive_value(raw_value, key_hint) if raw_value != "" else ""
+    return {
+        "label": label,
+        "name": name,
+        "id": field_id,
+        "type": field_type,
+        "required": _required_state(item.get("required")),
+        "current_value_redacted": redacted_value,
+        "candidate_meaning": _candidate_meaning(label, name, field_type),
+        "accepted_types": redact_sensitive_text(item.get("accept") or item.get("accepted_types") or item.get("accepts") or ""),
+    }
+
+
+def _normalise_upload_field(item: Any) -> dict[str, Any]:
+    field = _normalise_field(item)
+    if isinstance(item, dict):
+        accepted = item.get("accept") or item.get("accepted_types") or item.get("accepts")
+    else:
+        accepted = None
+    return {
+        "label": field["label"],
+        "name": field["name"],
+        "id": field["id"],
+        "accepted_types": redact_sensitive_text(accepted) if accepted else "unknown",
+        "required": field["required"],
+    }
+
+
+def _normalise_form(item: Any) -> dict[str, Any]:
+    item = item if isinstance(item, dict) else {"name": str(item)}
+    return {
+        "name": redact_sensitive_text(item.get("name") or ""),
+        "id": redact_sensitive_text(item.get("id") or ""),
+        "action": redact_sensitive_text(item.get("action") or item.get("target") or ""),
+        "fields": redact_sensitive_value(item.get("fields") or item.get("inputs") or []),
+        "submit_actions": redact_sensitive_value(item.get("submit_actions") or item.get("buttons") or []),
+    }
+
+
+def _structured_items(payload: Any, keys: tuple[str, ...]) -> list[Any]:
+    items: list[Any] = []
+    if isinstance(payload, dict):
+        for key in keys:
+            items.extend(_as_list(payload.get(key)))
+    role_map = {
+        "links": {"link", "a"},
+        "buttons": {"button"},
+        "fields": {"textbox", "input", "combobox", "checkbox", "radio", "searchbox"},
+    }
+    wanted = role_map.get(keys[0], set())
+    for node in _iter_dicts(payload):
+        role = str(node.get("role") or node.get("tag") or "").lower()
+        if role in wanted and node not in items:
+            items.append(node)
+    return [item for item in items if item not in (None, "")]
+
+
+def _safe_and_risky_actions(inventory: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    safe: list[dict[str, Any]] = []
+    risky: list[dict[str, Any]] = []
+    for link in inventory["links"]:
+        action = {
+            "action": "navigate",
+            "target": link.get("text") or link.get("href") or "link",
+            "reason": f"link classified as {link['classification']}",
+        }
+        if link["classification"] == "risky":
+            risky.append({**action, "requires_approval": True})
+        elif link["classification"] == "safe":
+            safe.append(action)
+    for button in inventory["buttons"]:
+        action = {
+            "action": "click",
+            "target": button.get("text") or "button",
+            "reason": f"button classified as {button['classification']}",
+        }
+        if button["classification"] == "risky":
+            risky.append({**action, "requires_approval": True})
+        elif button["classification"] == "safe":
+            safe.append(action)
+    for upload in inventory["upload_fields"]:
+        risky.append({
+            "action": "upload",
+            "target": upload.get("label") or upload.get("name") or "file input",
+            "reason": "file upload can disclose local files to a site",
+            "requires_approval": True,
+        })
+    return safe, risky
+
+
+def build_page_inventory(result: dict[str, Any] | Any) -> dict[str, Any]:
+    """Build a defensive page inventory from browser/MCP snapshot output."""
+    payload = _content_payload(result)
+    text = redact_sensitive_text(_text_from_payload(payload))
+    title = _first_string(payload, ("title", "page_title")) or _extract_labeled_line(text, "Title")
+    url = _first_string(payload, ("url", "href", "current_url")) or _extract_labeled_line(text, "URL")
+
+    links = [_normalise_link(item) for item in _structured_items(payload, ("links", "anchors"))]
+    buttons = [_normalise_button(item) for item in _structured_items(payload, ("buttons", "actions"))]
+    fields = [_normalise_field(item) for item in _structured_items(payload, ("fields", "inputs"))]
+    upload_fields = [
+        _normalise_upload_field(item)
+        for item in _structured_items(payload, ("upload_fields", "file_inputs"))
+    ]
+
+    if not links:
+        links = [_normalise_link(item) for item in _split_labeled_values(text, "Links")]
+    if not buttons:
+        buttons = [_normalise_button(item) for item in _split_labeled_values(text, "Buttons")]
+    if not fields:
+        fields = [_normalise_field(item) for item in _split_labeled_values(text, "Fields")]
+
+    for field in fields:
+        if field.get("type", "").lower() == "file" or "upload" in (field.get("candidate_meaning") or ""):
+            upload = {
+                "label": field.get("label", ""),
+                "name": field.get("name", ""),
+                "id": field.get("id", ""),
+                "accepted_types": field.get("accepted_types") or "unknown",
+                "required": field.get("required", "unknown"),
+            }
+            if upload not in upload_fields:
+                upload_fields.append(upload)
+
+    forms = [_normalise_form(item) for item in _structured_items(payload, ("forms",))]
+    inventory = {
+        "url": url or "",
+        "title": title or "",
+        "visible_text_summary": _compact_text(text),
+        "links": links,
+        "buttons": buttons,
+        "fields": fields,
+        "upload_fields": upload_fields,
+        "forms": forms,
+        "risky_actions": [],
+        "safe_actions": [],
+    }
+    inventory["safe_actions"], inventory["risky_actions"] = _safe_and_risky_actions(inventory)
+    return inventory
+
+
+def _format_inventory_list(label: str, items: list[dict[str, Any]], fields: tuple[str, ...]) -> list[str]:
+    lines = [label]
+    if not items:
+        lines.append("- None detected.")
+        return lines
+    for item in items[:10]:
+        details = []
+        for field in fields:
+            value = item.get(field)
+            if value not in (None, "", []):
+                details.append(f"{field}={value}")
+        lines.append(f"- {', '.join(details) if details else item}")
+    return lines
+
+
+def format_page_inventory(inventory: dict[str, Any]) -> str:
+    lines = [
+        "Page inventory",
+        "Observed page facts:",
+        f"- Title: {inventory.get('title') or 'unknown'}",
+        f"- URL: {inventory.get('url') or 'unknown'}",
+        f"- Visible text summary: {inventory.get('visible_text_summary') or 'unknown'}",
+    ]
+    lines.extend(_format_inventory_list("Detected links:", inventory["links"], ("text", "href", "classification")))
+    lines.extend(_format_inventory_list("Detected buttons:", inventory["buttons"], ("text", "type", "classification")))
+    lines.extend(_format_inventory_list("Detected fields:", inventory["fields"], ("label", "name", "type", "required", "candidate_meaning", "current_value_redacted")))
+    lines.extend(_format_inventory_list("Detected upload fields:", inventory["upload_fields"], ("label", "name", "accepted_types", "required")))
+    lines.extend(_format_inventory_list("Detected forms:", inventory["forms"], ("name", "id", "action", "fields", "submit_actions")))
+    lines.extend(_format_inventory_list("Safe actions:", inventory["safe_actions"], ("action", "target", "reason")))
+    lines.extend(_format_inventory_list("Risky actions requiring approval:", inventory["risky_actions"], ("action", "target", "reason", "requires_approval")))
+    lines.append("Unknowns/questions for the user:")
+    if not inventory["fields"] and not inventory["buttons"] and not inventory["links"]:
+        lines.append("- Snapshot did not expose controls; inspect a richer snapshot before acting.")
+    else:
+        lines.append("- Confirm intent before filling, uploading, submitting, or changing account/payment/security state.")
+    return "\n".join(lines)
+
+
 def format_browser_observation(tool: str, result: dict[str, Any]) -> str | None:
     """Readable browser read/prepare result for the operator path."""
     if not is_browser_mcp_tool_name(tool):
@@ -229,24 +575,11 @@ def format_browser_observation(tool: str, result: dict[str, Any]) -> str | None:
     content = result.get("content") or result.get("output") or result.get("results")
     if content:
         label = tool.rsplit("__", 1)[-1] if "__" in tool else tool
-        safe_content = redact_sensitive_text(str(content))[:3200]
-        title = _extract_labeled_line(safe_content, "Title")
-        url = _extract_labeled_line(safe_content, "URL")
-        action_lines = _extract_action_lines(safe_content)
-        lines = [f"Browser observation ({label}):", "Observed page facts:"]
-        if title:
-            lines.append(f"- Title: {title}")
-        if url:
-            lines.append(f"- URL: {url}")
-        lines.append(f"- Visible content summary: {safe_content}")
-        lines.append("Detected forms/buttons/actions:")
-        lines.extend(f"- {item}" for item in action_lines[:8])
-        if not action_lines:
-            lines.append("- None explicitly detected in the tool output.")
+        inventory = build_page_inventory(result)
+        lines = [f"Browser observation ({label}):", format_page_inventory(inventory)]
         lines.append("Inferred next steps:")
         lines.append("- Safe: inspect, summarize, navigate/read, or prepare form fields.")
-        lines.append("Risky actions requiring approval:")
-        lines.append("- submit/send/upload/buy/cancel/refund/return/delete/payment/account/security/admin actions.")
+        lines.append("- Ask before submitting, uploading, buying, deleting, or changing account/payment/security state.")
         return "\n".join(lines)
     if result.get("images"):
         label = tool.rsplit("__", 1)[-1] if "__" in tool else tool

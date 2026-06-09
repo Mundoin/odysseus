@@ -63,6 +63,7 @@ def test_browser_snapshot_result_formats_as_operator_observation():
     )
 
     assert "Browser observation" in text
+    assert "Page inventory" in text
     assert "Example Checkout" in text
     assert "Submit payment" in text
 
@@ -296,3 +297,116 @@ def test_confirmation_preview_event_payload_redacts_sensitive_values():
     assert "hunter2" not in rendered
     assert "abc123" not in rendered
     assert "4111111111111111" not in rendered
+
+
+def test_snapshot_text_builds_page_inventory_visible_text_summary():
+    from src.browser_operator import build_page_inventory
+
+    inventory = build_page_inventory(
+        {
+            "content": (
+                "Title: Example Checkout\n"
+                "URL: https://shop.example.test/checkout\n"
+                "Welcome to checkout. Buttons: Submit payment"
+            )
+        }
+    )
+
+    assert inventory["title"] == "Example Checkout"
+    assert inventory["url"] == "https://shop.example.test/checkout"
+    assert "Welcome to checkout" in inventory["visible_text_summary"]
+
+
+def test_structured_content_extracts_links_buttons_fields_forms_and_uploads():
+    from src.browser_operator import build_page_inventory
+
+    inventory = build_page_inventory(
+        {
+            "content": {
+                "url": "https://shop.example.test/checkout",
+                "title": "Checkout",
+                "text": "Review your cart before payment.",
+                "links": [
+                    {"text": "View cart", "href": "/cart"},
+                    {"text": "Delete account", "href": "/account/delete"},
+                ],
+                "buttons": [
+                    {"text": "Search", "type": "button"},
+                    {"text": "Pay now", "type": "submit"},
+                ],
+                "inputs": [
+                    {"label": "Email", "name": "email", "type": "email", "required": True, "value": "bujar@example.test"},
+                    {"label": "Password", "name": "password", "type": "password", "required": True, "value": "hunter2"},
+                    {"label": "Receipt upload", "name": "receipt", "type": "file", "accept": ".pdf,.png"},
+                ],
+                "forms": [
+                    {
+                        "id": "checkout-form",
+                        "action": "/pay",
+                        "fields": ["email", "password", "receipt"],
+                        "submit_actions": ["Pay now"],
+                    }
+                ],
+            }
+        }
+    )
+
+    assert inventory["links"][0]["text"] == "View cart"
+    assert inventory["links"][0]["classification"] == "safe"
+    assert inventory["links"][1]["classification"] == "risky"
+    assert inventory["buttons"][0]["classification"] == "safe"
+    assert inventory["buttons"][1]["classification"] == "risky"
+    assert inventory["fields"][0]["required"] == "required"
+    assert inventory["fields"][1]["current_value_redacted"] == "[REDACTED]"
+    assert inventory["upload_fields"][0]["accepted_types"] == ".pdf,.png"
+    assert inventory["forms"][0]["id"] == "checkout-form"
+    assert any(action["target"] == "Pay now" for action in inventory["risky_actions"])
+    assert any(action["target"] == "Search" for action in inventory["safe_actions"])
+
+
+def test_page_inventory_redacts_secret_values_everywhere():
+    from src.browser_operator import build_page_inventory
+
+    inventory = build_page_inventory(
+        {
+            "content": {
+                "title": "Secrets",
+                "text": "Token token=abc123 card 4111 1111 1111 1111",
+                "fields": [
+                    {"label": "API key", "name": "api_key", "value": "sk-secret"},
+                    {"label": "Private message", "name": "private_message", "value": "hello quietly"},
+                ],
+            }
+        }
+    )
+
+    rendered = str(inventory)
+    assert "abc123" not in rendered
+    assert "4111 1111 1111 1111" not in rendered
+    assert "sk-secret" not in rendered
+    assert "hello quietly" not in rendered
+
+
+def test_browser_operator_output_shows_page_inventory_sections():
+    from src.browser_operator import format_browser_observation
+
+    text = format_browser_observation(
+        "mcp__builtin_browser__browser_snapshot",
+        {
+            "content": {
+                "title": "Search",
+                "url": "https://example.test",
+                "links": [{"text": "View help", "href": "/help"}],
+                "buttons": [{"text": "Search"}],
+                "fields": [{"label": "Query", "name": "q", "type": "search"}],
+            }
+        },
+    )
+
+    assert "Page inventory" in text
+    assert "Detected links:" in text
+    assert "Detected buttons:" in text
+    assert "Detected fields:" in text
+    assert "Safe actions:" in text
+    assert "Risky actions requiring approval:" in text
+    assert "Unknowns/questions for the user:" in text
