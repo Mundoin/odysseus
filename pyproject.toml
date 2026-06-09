@@ -23,4 +23,5 @@ markers = [
     "sub_tool_list: final tool-schema list correctness tests",
     "sub_external_action_guards: api_call / app_api external-action confirmation gate tests",
     "sub_mcp_dispatch_guards: MCP dispatch layer external-action confirmation gate tests",
+    "sub_live_browser_smoke: live/local browser guardrail smoke harness tests",
 ]
