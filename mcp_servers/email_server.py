@@ -885,9 +885,54 @@ def _smtp_connect(account=None, cfg=None):
     return conn
 
 
-def _send_email(to, subject, body, in_reply_to=None, references=None, cc=None, bcc=None, account=None):
-    """Send an email via SMTP. Returns dict with status."""
+def _list_smtp_account_names() -> list[str]:
+    """Return display names of all enabled SMTP-capable accounts."""
+    try:
+        from core.database import SessionLocal as _SL, EmailAccount as _EA
+        db = _SL()
+        try:
+            rows = db.query(_EA).filter(_EA.enabled == True).all()  # noqa: E712
+            return [r.name for r in rows if r.smtp_host and r.smtp_user]
+        finally:
+            db.close()
+    except Exception:
+        return []
+
+
+def _send_email(to, subject, body, in_reply_to=None, references=None, cc=None, bcc=None, account=None, confirmed=False):
+    """Send an email via SMTP. Returns dict with status.
+
+    If ``confirmed`` is False (default), returns a preview dict and does NOT
+    send.  The caller must show the preview to the user, obtain explicit
+    approval, then call again with ``confirmed=True``.
+
+    If ``account`` is not specified, raises ValueError listing available SMTP
+    accounts instead of silently falling back to the default.
+    """
+    if not account:
+        available = _list_smtp_account_names()
+        raise ValueError(
+            "sender account not specified. "
+            f"Available SMTP accounts: {available or 'none configured'}. "
+            "Pass the account name or id via the 'account' parameter."
+        )
     send_account, cfg = _resolve_send_config(account)
+    if not confirmed:
+        return {
+            "pending_confirmation": True,
+            "from": cfg.get("from_address"),
+            "account": cfg.get("account_name"),
+            "account_id": cfg.get("account_id"),
+            "to": to,
+            "cc": cc,
+            "bcc": bcc,
+            "subject": subject,
+            "body_preview": body[:500] + ("…" if len(body) > 500 else ""),
+            "instruction": (
+                "Show this preview to the user and ask for explicit approval. "
+                "If approved, call send_email again with confirmed=true and the same parameters."
+            ),
+        }
     msg = EmailMessage()
     msg["From"] = _clean_header_value(cfg["from_address"])
     msg["To"] = _clean_header_value(to if isinstance(to, str) else ", ".join(to))
@@ -1284,7 +1329,7 @@ async def _ai_draft_reply_to_email(uid, folder="INBOX", reply_all=False, account
     )
 
 
-def _reply_to_email(uid, body, folder="INBOX", reply_all=False, account=None):
+def _reply_to_email(uid, body, folder="INBOX", reply_all=False, account=None, confirmed=False):
     """Reply to an existing email by UID. Threads via In-Reply-To/References."""
     conn = None
     try:
@@ -1328,6 +1373,7 @@ def _reply_to_email(uid, body, folder="INBOX", reply_all=False, account=None):
         references=new_references,
         cc=cc,
         account=account,
+        confirmed=confirmed,
     )
 
 
@@ -1576,11 +1622,13 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="send_email",
             description=(
-                "Send a new email via SMTP. Provide recipient(s), subject, and body. "
-                "This sends immediately; for normal assistant-written email, prefer "
-                "draft_email so the user can review and send from Odysseus. "
-                "For replying to an existing thread, use reply_to_email instead. "
-                "Pass `account` to send from a non-default mailbox."
+                "Send a new email via SMTP. Requires explicit sender account selection and "
+                "user approval before delivery. Call once without confirmed=true to receive "
+                "a preview; show the preview to the user; call again with confirmed=true only "
+                "after the user explicitly approves. The 'account' parameter is required — "
+                "never omit it or rely on a default. For normal assistant-written email, "
+                "prefer draft_email so the user can review and send from Odysseus. "
+                "For replying to an existing thread, use reply_to_email instead."
             ),
             inputSchema={
                 "type": "object",
@@ -1590,9 +1638,24 @@ async def list_tools() -> list[Tool]:
                     "body": {"type": "string", "description": "Plain text body"},
                     "cc": {"type": "string", "description": "CC address(es), comma-separated (optional)"},
                     "bcc": {"type": "string", "description": "BCC address(es), comma-separated (optional)"},
-                    **ACCOUNT_PROP,
+                    "account": {
+                        "type": "string",
+                        "description": (
+                            "REQUIRED. Name, email address, or id of the SMTP account to send from. "
+                            "Never omit — sending without an explicit account is blocked. "
+                            "Use list_email_accounts to discover available accounts."
+                        ),
+                    },
+                    "confirmed": {
+                        "type": "boolean",
+                        "description": (
+                            "Set to true only after the user has explicitly approved the preview. "
+                            "Omit or set false to receive a preview without sending."
+                        ),
+                        "default": False,
+                    },
                 },
-                "required": ["to", "subject", "body"],
+                "required": ["to", "subject", "body", "account"],
             },
         ),
         Tool(
@@ -1621,9 +1684,12 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="reply_to_email",
             description=(
-                "Reply to an existing email by UID. This sends immediately; for normal "
-                "assistant-written replies, prefer draft_email_reply so the user can "
-                "review and send from Odysseus. Automatically threads the reply with "
+                "Reply to an existing email by UID. Requires explicit sender account and "
+                "user approval before delivery. Call once without confirmed=true to receive "
+                "a preview; show the preview to the user; call again with confirmed=true only "
+                "after the user explicitly approves. The 'account' parameter is required. "
+                "For normal assistant-written replies, prefer draft_email_reply so the user "
+                "can review and send from Odysseus. Automatically threads the reply with "
                 "In-Reply-To and References headers, prefixes 'Re:' on the subject, and "
                 "uses the original sender as the recipient. Set reply_all=true to also CC "
                 "the original To/Cc recipients. For follow-up 'reply ...' requests, use "
@@ -1636,9 +1702,23 @@ async def list_tools() -> list[Tool]:
                     "body": {"type": "string", "description": "Reply body text"},
                     "folder": {"type": "string", "description": "IMAP folder (default: INBOX)", "default": "INBOX"},
                     "reply_all": {"type": "boolean", "description": "Reply to all recipients (default: false)", "default": False},
-                    **ACCOUNT_PROP,
+                    "account": {
+                        "type": "string",
+                        "description": (
+                            "REQUIRED. Name, email address, or id of the SMTP account to send from. "
+                            "Never omit — sending without an explicit account is blocked."
+                        ),
+                    },
+                    "confirmed": {
+                        "type": "boolean",
+                        "description": (
+                            "Set to true only after the user has explicitly approved the preview. "
+                            "Omit or set false to receive a preview without sending."
+                        ),
+                        "default": False,
+                    },
                 },
-                "required": ["uid", "body"],
+                "required": ["uid", "body", "account"],
             },
         ),
         Tool(
@@ -2006,7 +2086,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 cc=arguments.get("cc"),
                 bcc=arguments.get("bcc"),
                 account=acct,
+                confirmed=bool(arguments.get("confirmed", False)),
             )
+            if result.get("pending_confirmation"):
+                import json as _json
+                return [TextContent(type="text", text=_json.dumps(result, indent=2))]
             acct_note = f" (from {result['account']})" if result.get("account") else ""
             return [TextContent(type="text", text=f"Sent email to {result['to']} with subject '{result['subject']}'{acct_note}.")]
 
@@ -2046,10 +2130,14 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 folder=arguments.get("folder", "INBOX"),
                 reply_all=bool(arguments.get("reply_all", False)),
                 account=acct,
+                confirmed=bool(arguments.get("confirmed", False)),
             )
+            if result.get("pending_confirmation"):
+                import json as _json
+                return [TextContent(type="text", text=_json.dumps(result, indent=2))]
             if "error" in result:
                 return [TextContent(type="text", text=f"Error: {result['error']}")]
-            # Mark original as answered
+            # Mark original as answered only after confirmed send
             try:
                 _set_flag(uid, arguments.get("folder", "INBOX"), "\\Answered", add=True, account=acct)
             except Exception:

@@ -253,19 +253,8 @@ def _smtp_ready(cfg: dict) -> bool:
     return bool(cfg.get("smtp_host") and cfg.get("smtp_user") and cfg.get("smtp_password"))
 
 
-def _resolve_send_config(account_id: str | None = None, owner: str = "") -> dict:
-    """Resolve an account for outbound SMTP.
-
-    If the caller explicitly picked an account, use only that account and
-    return a clear error when it cannot send. If no account was picked and
-    the default is receive-only, fall back to the first SMTP-capable account
-    owned by the same user.
-    """
-    cfg = _get_email_config(account_id, owner=owner)
-    if _smtp_ready(cfg):
-        return cfg
-    if account_id:
-        raise ValueError(f"Email account {cfg.get('account_name') or account_id} has no SMTP configured")
+def _list_smtp_account_names_for_owner(owner: str = "") -> list[str]:
+    """Return display names of enabled SMTP-capable accounts visible to *owner*."""
     try:
         from core.database import SessionLocal as _SL, EmailAccount as _EA
         from sqlalchemy import and_, or_
@@ -276,15 +265,32 @@ def _resolve_send_config(account_id: str | None = None, owner: str = "") -> dict
                 unowned = or_(_EA.owner == None, _EA.owner == "")  # noqa: E711
                 same_mailbox = or_(_EA.imap_user == owner, _EA.from_address == owner)
                 q = q.filter(or_(_EA.owner == owner, and_(unowned, same_mailbox)))
-            for row in q.order_by(_EA.is_default.desc(), _EA.created_at.asc()).all():
-                trial = _get_email_config(account_id=row.id, owner=owner)
-                if _smtp_ready(trial):
-                    return trial
+            return [r.name for r in q.all() if r.smtp_host and r.smtp_user]
         finally:
             db.close()
-    except Exception as e:
-        logger.debug(f"SMTP-capable account fallback failed: {e}")
-    raise ValueError("No SMTP-capable email account configured")
+    except Exception:
+        return []
+
+
+def _resolve_send_config(account_id: str | None = None, owner: str = "") -> dict:
+    """Resolve an account for outbound SMTP.
+
+    If the caller explicitly picked an account, use only that account and
+    return a clear error when it cannot send. If no account was picked and
+    the default is receive-only, fall back to the first SMTP-capable account
+    owned by the same user.
+    """
+    if not account_id:
+        available = _list_smtp_account_names_for_owner(owner)
+        raise ValueError(
+            "sender account not specified. "
+            f"Available SMTP accounts: {available or 'none configured'}. "
+            "Provide an explicit account_id."
+        )
+    cfg = _get_email_config(account_id, owner=owner)
+    if _smtp_ready(cfg):
+        return cfg
+    raise ValueError(f"Email account {cfg.get('account_name') or account_id} has no SMTP configured")
 
 
 def _store_email_flag(conn, uid: str, flag: str, add: bool = True) -> bool:
@@ -2123,15 +2129,49 @@ def setup_email_routes():
     async def send_email(req: SendEmailRequest, background_tasks: BackgroundTasks, owner: str = Depends(require_owner)):
         """Queue an email for SMTP delivery. Returns immediately; send runs in background.
 
-        Uses req.account_id to pick the sending account (falls back to default)."""
+        req.account_id is required — omitting it returns an error listing available accounts.
+        req.confirmed must be true for delivery to proceed; omitting it returns a preview."""
         # Body-based account_id — dep can't see it, check here.
         if req.account_id:
             _assert_owns_account(req.account_id, owner)
 
         try:
             cfg = _resolve_send_config(req.account_id, owner=owner)
-        except Exception as e:
-            return {"success": False, "error": str(e) or "No SMTP-capable email account configured"}
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
+
+        # Block if caller specified a from_address that doesn't match the
+        # resolved SMTP identity (prevents silent account substitution).
+        if req.from_address:
+            resolved_from = cfg.get("from_address", "")
+            if req.from_address.strip().lower() != resolved_from.strip().lower():
+                return {
+                    "success": False,
+                    "error": (
+                        f"Requested sender '{req.from_address}' does not match "
+                        f"the SMTP identity for account '{cfg.get('account_name')}' "
+                        f"({resolved_from}). Choose the correct account or omit from_address."
+                    ),
+                }
+
+        # Preview gate — return a confirmation preview without touching SMTP.
+        if not req.confirmed:
+            body_preview = req.body[:500] + ("…" if len(req.body) > 500 else "")
+            return {
+                "pending_confirmation": True,
+                "from": cfg.get("from_address"),
+                "account": cfg.get("account_name"),
+                "account_id": cfg.get("account_id"),
+                "to": req.to,
+                "cc": req.cc,
+                "bcc": req.bcc,
+                "subject": req.subject,
+                "body_preview": body_preview,
+                "instruction": (
+                    "Review the details above and resubmit with confirmed=true "
+                    "to complete delivery."
+                ),
+            }
 
         # Use 'mixed' if we have attachments, 'alternative' otherwise
         has_attachments = bool(req.attachments)

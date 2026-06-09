@@ -1498,12 +1498,18 @@ class SendEmailRequest(BaseModel):
     references: Optional[str] = None
     # List of uploaded attachment tokens (filenames in COMPOSE_UPLOADS_DIR)
     attachments: Optional[List[str]] = None
-    # Which account to send from. None = default account.
+    # Which account to send from. Required — omitting is blocked server-side.
     account_id: Optional[str] = None
+    # Optional expected sender address. If provided and does not match the
+    # resolved SMTP from_address, the send is blocked before SMTP is touched.
+    from_address: Optional[str] = None
     # Internal marker for Odysseus-generated mail (e.g. reminder, scheduled).
     odysseus_kind: Optional[str] = None
     # If true, /send waits for SMTP + Sent append and returns the sent UID.
     wait_for_delivery: bool = False
+    # Must be explicitly true for SMTP delivery to proceed.
+    # Omit or set false to receive a preview without sending.
+    confirmed: bool = False
 
 
 class ExtractStyleRequest(BaseModel):
