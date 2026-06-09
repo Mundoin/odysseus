@@ -45,6 +45,7 @@ class SkillAddRequest(BaseModel):
     source: str = "user"
     teacher_model: Optional[str] = None
     session_id: Optional[str] = None
+    confirmed: bool = False  # must be true for skill to be written
 
     # Old schema (back-compat)
     title: Optional[str] = Field(None, max_length=200)
@@ -55,6 +56,7 @@ class SkillAddRequest(BaseModel):
 
 class SkillImportUrlRequest(BaseModel):
     url: str = Field(..., min_length=8, max_length=2000)
+    confirmed: bool = False  # must be true for import to execute
 
 
 class SkillUpdateRequest(BaseModel):
@@ -73,6 +75,7 @@ class SkillUpdateRequest(BaseModel):
     version: Optional[str] = None
     confidence: Optional[float] = None
     body_extra: Optional[str] = None
+    confirmed: bool = False  # must be true for update to be written
     # Old shape
     title: Optional[str] = None
     problem: Optional[str] = None
@@ -1243,6 +1246,16 @@ def setup_skills_routes(skills_manager: SkillsManager) -> APIRouter:
         """Install a SKILL.md bundle from a public GitHub URL (skills.sh links supported)."""
         require_admin(request)
         user = _owner(request)
+
+        if not body.confirmed:
+            return {
+                "pending_confirmation": True,
+                "action": "import-from-url",
+                "url": body.url.strip(),
+                "warning": "This will download and install an external skill bundle.",
+                "instruction": "Re-submit with confirmed=true to execute the import.",
+            }
+
         from services.memory.skill_importer import (
             SkillImportError,
             fetch_skill_bundle,
@@ -1271,6 +1284,15 @@ def setup_skills_routes(skills_manager: SkillsManager) -> APIRouter:
     @router.post("/add")
     async def add_skill(request: Request, body: SkillAddRequest):
         user = _owner(request)
+        if not body.confirmed:
+            return {
+                "pending_confirmation": True,
+                "action": "add",
+                "name": body.name or body.title or "(unnamed)",
+                "description": (body.description or body.problem or "")[:200],
+                "category": body.category,
+                "instruction": "Re-submit with confirmed=true to create the skill.",
+            }
         entry = skills_manager.add_skill(
             # New shape
             name=body.name,
@@ -1558,6 +1580,14 @@ def setup_skills_routes(skills_manager: SkillsManager) -> APIRouter:
         new_content = body.get("markdown")
         if not isinstance(new_content, str) or not new_content.strip():
             raise HTTPException(400, "markdown is required")
+        if not body.get("confirmed"):
+            return {
+                "pending_confirmation": True,
+                "action": "save-markdown",
+                "skill_id": skill_id,
+                "content_length": len(new_content),
+                "instruction": "Re-submit with confirmed=true to overwrite the skill.",
+            }
         skills = skills_manager.load(owner=user)
         match = next((s for s in skills if s.get("name") == skill_id or s.get("id") == skill_id), None)
         if not match:
@@ -1605,13 +1635,20 @@ def setup_skills_routes(skills_manager: SkillsManager) -> APIRouter:
     @router.put("/{skill_id}")
     async def update_skill(request: Request, skill_id: str, body: SkillUpdateRequest):
         user = _owner(request)
+        if not body.confirmed:
+            return {
+                "pending_confirmation": True,
+                "action": "update",
+                "skill_id": skill_id,
+                "instruction": "Re-submit with confirmed=true to apply the update.",
+            }
         skills = skills_manager.load(owner=user)
         match = next((s for s in skills if s.get("name") == skill_id or s.get("id") == skill_id), None)
         if not match:
             raise HTTPException(404, "Skill not found")
         _verify_owner(match, user)
 
-        updates = body.dict(exclude_none=True)
+        updates = {k: v for k, v in body.model_dump(exclude_none=True).items() if k != "confirmed"}
         if not updates:
             return {"ok": True}
         ok = skills_manager.update_skill(match.get("name"), updates, owner=user)
@@ -1622,8 +1659,16 @@ def setup_skills_routes(skills_manager: SkillsManager) -> APIRouter:
         return {"ok": True}
 
     @router.delete("/{skill_id}")
-    async def delete_skill(request: Request, skill_id: str):
+    async def delete_skill(request: Request, skill_id: str, confirmed: bool = False):
         user = _owner(request)
+        if not confirmed:
+            return {
+                "pending_confirmation": True,
+                "action": "delete",
+                "skill_id": skill_id,
+                "warning": "Skill directory will be permanently removed.",
+                "instruction": "Re-submit with ?confirmed=true to delete.",
+            }
         skills = skills_manager.load(owner=user)
         match = next((s for s in skills if s.get("name") == skill_id or s.get("id") == skill_id), None)
         if not match:
