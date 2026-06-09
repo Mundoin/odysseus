@@ -15,4 +15,10 @@ markers = [
     "area_helpers: self-tests for the shared test helpers in tests/helpers/",
     "area_unit: pure parser / utility tests that do not clearly belong elsewhere",
     "area_uncategorized: tests not yet matched by the taxonomy (fallback)",
+    # sub_* markers for guard and tool-exposure test suites
+    "sub_email_send_guards: email send / reply confirmation gate tests",
+    "sub_http_skill_guards: HTTP skill mutation confirmation gate tests",
+    "sub_skill_guards: agent tool manage_skills confirmation gate tests",
+    "sub_email_tool_exposure: email tool schema visibility and model classification tests",
+    "sub_tool_list: final tool-schema list correctness tests",
 ]

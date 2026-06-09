@@ -32,11 +32,10 @@ NON_ADMIN_BLOCKED_TOOLS = {
     "manage_settings",
     "api_call",
     "app_api",
-    "send_email",
-    "reply_to_email",
-    "list_emails",
-    "read_email",
-    "resolve_contact",
+    # Email tools are intentionally NOT blocked for resource owners.
+    # send_email/reply_to_email require account_id + confirmed=true at execution;
+    # list_emails/read_email are read-only. Safety is in the execution guards,
+    # not schema suppression.
     "manage_contact",
     "manage_calendar",
     "vault_search",

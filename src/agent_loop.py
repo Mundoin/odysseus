@@ -1894,7 +1894,8 @@ async def stream_agent_loop(
         # Local-served models that follow OpenAI-style function calling
         # via vLLM's `--enable-auto-tool-choice`. Belt-and-suspenders
         # with the per-endpoint flag above.
-        "minimax", "kimi", "yi-", "phi-3", "phi-4", "command-r",
+        "minimax", "kimi", "moonshot",  # Moonshot/Kimi cloud API
+        "yi-", "phi-3", "phi-4", "command-r",
         "glm-4", "internlm", "hermes",
         # deepseek-v2/v3/chat support tools via the cloud API; deepseek-r1
         # (reasoning model) does not — handled by the blocklist below.
@@ -2136,6 +2137,20 @@ async def stream_agent_loop(
             _last_content = _last_user.lower()
             _wants_mcp = any(kw in _last_content for kw in _MCP_KEYWORDS)
             all_tool_schemas = mcp_schemas if (_wants_mcp and mcp_schemas) else []
+            # Report why tool-reliant features are unavailable for this model/endpoint.
+            _email_tools_wanted = (
+                _relevant_tools is not None
+                and bool(_relevant_tools & {"send_email", "reply_to_email", "list_emails", "read_email"})
+            )
+            if _email_tools_wanted and round_num == 1:
+                logger.warning(
+                    "[agent] model=%r endpoint=%r does not support native tool calling "
+                    "(endpoint_supports=%r _is_ollama_native=%r). Email tools were "
+                    "requested but schemas are suppressed. To enable: set "
+                    "supports_tools=True on this endpoint, or switch to a "
+                    "tool-capable model (Claude, GPT-4, Gemini, DeepSeek-Chat).",
+                    model, endpoint_url, _endpoint_supports, _is_ollama_native,
+                )
         agent_stream_timeout = int(get_setting("agent_stream_timeout_seconds", 300) or 300)
 
         _tool_names_sent = [t.get("function", {}).get("name") for t in (all_tool_schemas or []) if t.get("function")]
