@@ -625,3 +625,107 @@ def test_missing_runtime_does_not_invent_browser_tools():
     assert all("browser" not in n for n in relevant), (
         "No browser tools should be added when runtime has none"
     )
+
+
+# ── Fill tool exposure in schemas ─────────────────────────────────────────
+
+def test_fill_tools_appear_in_openai_schemas_when_connected():
+    """browser_fill, browser_type, browser_select_option must appear in
+    function-call schemas when browser MCP is connected."""
+    from src.mcp_manager import McpManager
+
+    mgr = McpManager()
+    mgr._tools = {
+        "builtin_browser": [
+            {"name": "browser_snapshot", "description": "Snapshot.", "input_schema": {}},
+            {"name": "browser_navigate", "description": "Navigate.", "input_schema": {}},
+            {"name": "browser_fill", "description": "Fill a field.", "input_schema": {}},
+            {"name": "browser_type", "description": "Type into a field.", "input_schema": {}},
+            {"name": "browser_select_option", "description": "Select an option.", "input_schema": {}},
+        ]
+    }
+    mgr._connections = {"builtin_browser": {"status": "connected", "name": "Built-in: Browser"}}
+
+    schemas = mgr.get_all_openai_schemas()
+    names = {s["function"]["name"] for s in schemas}
+
+    assert "mcp__builtin_browser__browser_fill" in names
+    assert "mcp__builtin_browser__browser_type" in names
+    assert "mcp__builtin_browser__browser_select_option" in names
+    assert "mcp__builtin_browser__browser_snapshot" in names
+
+
+# ── Follow-up keeps browser tools via tool-execution user messages ─────────
+
+def test_followup_after_browser_tool_result_keeps_fill_tools():
+    """After a browser tool execution result is injected as a user message,
+    the follow-up turn should retain browser fill tools."""
+    from types import SimpleNamespace
+    from src.browser_operator import is_browser_mcp_tool_name
+
+    fake_mgr = SimpleNamespace()
+    fake_mgr.get_all_tools = lambda dmap=None: [
+        {"name": "browser_snapshot", "server_id": "builtin_browser",
+         "qualified_name": "mcp__builtin_browser__browser_snapshot"},
+        {"name": "browser_fill", "server_id": "builtin_browser",
+         "qualified_name": "mcp__builtin_browser__browser_fill"},
+        {"name": "browser_type", "server_id": "builtin_browser",
+         "qualified_name": "mcp__builtin_browser__browser_type"},
+        {"name": "browser_navigate", "server_id": "builtin_browser",
+         "qualified_name": "mcp__builtin_browser__browser_navigate"},
+    ]
+
+    relevant = {"ask_user", "manage_memory"}
+    # Simulate: a user message with tool execution result triggers pin
+    messages = [
+        {"role": "user", "content": "browse to example.com"},
+        {"role": "assistant", "content": "Let me navigate there first."},
+        {"role": "user", "content": "[Tool execution results]\nmcp__builtin_browser__browser_navigate OK\nmcp__builtin_browser__browser_snapshot: page loaded"},
+    ]
+    _browser_seen = False
+    for _msg in reversed(messages):
+        _content = _msg.get("content", "") or ""
+        if isinstance(_content, str) and (
+            "browser_" in _content
+            or "mcp__builtin_browser__" in _content
+        ):
+            _browser_seen = True
+            break
+    assert _browser_seen, "Tool execution result with browser_ should be detected"
+
+    if _browser_seen:
+        for t in fake_mgr.get_all_tools():
+            if is_browser_mcp_tool_name(t.get("name", "")):
+                qualified = t.get("qualified_name") or f"mcp__{t['server_id']}__{t['name']}"
+                relevant.add(qualified)
+
+    assert "mcp__builtin_browser__browser_fill" in relevant
+    assert "mcp__builtin_browser__browser_type" in relevant
+    assert "mcp__builtin_browser__browser_snapshot" in relevant
+    assert "mcp__builtin_browser__browser_navigate" in relevant
+
+
+# ── Browser domain detection for fill-related prompts ─────────────────────
+
+def test_classify_detects_fill_plan_from_prompt():
+    from src.agent_loop import _classify_agent_request
+    intent = _classify_agent_request([], "Build a page inventory and create a form-fill plan")
+    assert "browser" in intent["domains"]
+
+
+def test_classify_detects_fill_approved_followup_with_context():
+    """A follow-up like 'fill fields now' should detect browser domain
+    when recent context includes browser-operator terms."""
+    messages = [
+        {"role": "user", "content": "build a page inventory on the current page"},
+        {"role": "assistant", "content": "Here is the page inventory and fill plan..."},
+    ]
+    from src.agent_loop import _classify_agent_request
+    intent = _classify_agent_request(messages, "fill fields now")
+    assert "browser" in intent["domains"]
+
+
+def test_classify_detects_verify_after_fill():
+    from src.agent_loop import _classify_agent_request
+    intent = _classify_agent_request([], "take a browser snapshot to verify the fill")
+    assert "browser" in intent["domains"]

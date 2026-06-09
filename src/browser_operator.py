@@ -4,8 +4,12 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import logging
 import re
 from typing import Any
+
+
+logger = logging.getLogger(__name__)
 
 
 BROWSER_OPERATOR_RULES = """\
@@ -1021,14 +1025,71 @@ def _public_fill_call(call: dict[str, Any]) -> dict[str, Any]:
     return public_call
 
 
+def _discover_browser_tool(
+    mcp_mgr: Any | None,
+    candidates: tuple[str, ...],
+    fallback: str,
+    tool_kind: str = "fill",
+) -> str:
+    """Discover the actual tool name from a connected MCP manager.
+
+    Tries each candidate; if any bare name exists among the connected MCP
+    tools (regardless of server prefix), returns the qualified name.
+    Falls back to the hardcoded fallback when no MCP is connected or none
+    of the candidates are found.
+    """
+    if not mcp_mgr:
+        return fallback
+    try:
+        all_tools = mcp_mgr.get_all_tools()
+        if not all_tools:
+            return fallback
+        available_names = {t.get("name", "") for t in all_tools}
+        available_qualified = {(t.get("name", ""), t.get("qualified_name", "")) for t in all_tools}
+        for candidate in candidates:
+            bare = candidate.split("__")[-1]
+            if bare in available_names:
+                # Found it as a bare name — return its qualified form
+                for name, qualified in available_qualified:
+                    if name == bare and qualified:
+                        return qualified
+                return candidate
+            if candidate in available_names:
+                return candidate
+        logger.debug("No browser %s tool found among candidates %s; using fallback %s", tool_kind, candidates, fallback)
+    except Exception as _e:
+        logger.debug("Tool discovery for %s failed: %s", tool_kind, _e)
+    return fallback
+
+
 def build_safe_browser_fill_calls(
     form_fill_plan: dict[str, Any],
     known_values: dict[str, Any],
     batch_size: int = 3,
-    fill_tool_name: str = "mcp__builtin_browser__browser_fill",
-    snapshot_tool_name: str = "mcp__builtin_browser__browser_snapshot",
+    fill_tool_name: str | None = None,
+    snapshot_tool_name: str | None = None,
+    mcp_mgr: Any | None = None,
 ) -> dict[str, Any]:
-    """Build raw MCP fill calls plus redacted public call previews."""
+    """Build raw MCP fill calls plus redacted public call previews.
+
+    Tool names are auto-discovered from ``mcp_mgr`` when provided, falling
+    back to the built-in Playwright MCP defaults (mcp__builtin_browser__).
+    """
+    # Auto-discover tool names from the connected MCP manager
+    if fill_tool_name is None:
+        fill_tool_name = _discover_browser_tool(
+            mcp_mgr,
+            ("browser_fill", "browser_type", "mcp__builtin_browser__browser_fill"),
+            fallback="mcp__builtin_browser__browser_fill",
+            tool_kind="fill",
+        )
+    if snapshot_tool_name is None:
+        snapshot_tool_name = _discover_browser_tool(
+            mcp_mgr,
+            ("browser_snapshot", "mcp__builtin_browser__browser_snapshot"),
+            fallback="mcp__builtin_browser__browser_snapshot",
+            tool_kind="snapshot",
+        )
     execution = build_safe_fill_execution_steps(form_fill_plan, batch_size=batch_size)
     known_values = known_values or {}
     calls: list[dict[str, Any]] = []

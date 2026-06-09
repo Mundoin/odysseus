@@ -276,7 +276,10 @@ _DOMAIN_RULES = {
 - Read-only tools (snapshot, screenshot, console/network inspection) are always allowed.
 - Filling safe text-like fields is allowed as local prepare. Stop before any submit/upload/apply/payment/send action.
 - If a browser tool returns `pending_confirmation`, show the preview to the user and wait for explicit chat approval. Only then retry with `confirmed=true`.
-- If the browser runtime is not connected, say "Browser automation runtime is not connected" and list the missing setup (npx @playwright/mcp must be cached). Do not pretend browser tools exist.""",
+- If the browser runtime is not connected, say "Browser automation runtime is not connected" and list the missing setup (npx @playwright/mcp must be cached). Do not pretend browser tools exist.
+- Safe fill workflow: after the user explicitly approves a fill plan, execute fills using the available fill/type/select tools (`browser_fill`, `browser_type`, `browser_select_option`). Do NOT ask for approval again for the same approved fill batch — proceed to execute.
+- Batch safe fills in groups of 2-3 fields, then verify with a snapshot after each batch. Report which fields succeeded, failed, or could not be verified.
+- If no fill/type/select tools are available, say which specific tool names are missing, not "browser tools are unavailable".""",
 }
 
 _DOMAIN_TOOL_MAP = {
@@ -1380,12 +1383,29 @@ def _build_base_prompt(
             browser_status = mcp_mgr.get_browser_operator_status()
             if browser_status.get("browser_ready"):
                 tool_list = browser_status.get("tools", [])
+                read_tools = [t for t in tool_list if t.endswith(("_snapshot", "_navigate", "_screenshot", "_wait_for", "_tabs", "_resize", "_hover", "_close", "_go_back", "_console_messages", "_network_requests"))]
+                fill_tools = [t for t in tool_list if t.endswith(("_fill", "_type", "_select_option"))]
+
+                diagnostic_lines = [
+                    f"Exposed browser tools ({len(tool_list)}): "
+                    + ", ".join(f"`{t}`" for t in tool_list[:12])
+                    + ("..." if len(tool_list) > 12 else ""),
+                ]
+                if fill_tools:
+                    diagnostic_lines.append(
+                        f"Fill/type tools available: {', '.join(f'`{t}`' for t in fill_tools)}. "
+                        "Use these to fill safe text fields. Batch fills then verify with a snapshot."
+                    )
+                else:
+                    diagnostic_lines.append(
+                        "Fill/type tools (`browser_fill`, `browser_type`, `browser_select_option`) "
+                        "are NOT currently available. Only read/inspect tools are present."
+                    )
+
                 agent_prompt += (
                     "\n\n## Browser automation runtime\n"
                     "Browser automation tools are CONNECTED and available.\n"
-                    f"Exposed browser tools ({len(tool_list)}): "
-                    + ", ".join(f"`{t}`" for t in tool_list[:12])
-                    + ("..." if len(tool_list) > 12 else "")
+                    + "\n".join(diagnostic_lines)
                     + "\n\nUse `browser_snapshot` or equivalent inspection tool before planning any browser action. "
                     "Safe text-like field fills are allowed. Submit/upload/apply/payment/send/delete/account actions "
                     "require explicit current-chat approval."
@@ -1942,27 +1962,35 @@ async def stream_agent_loop(
     # turn used a browser MCP tool, keep them available so "current page"
     # / "form-fill" intents don't lose access on the very next turn when
     # the domain detection might not fire (e.g. a terse follow-up).
+    # ALSO check user messages that may contain tool execution results
+    # (injected as role=user), since the LLM's prior tool calls produce
+    # "[Tool execution results]\nmcp__builtin_browser__..." in user role.
     if not guide_only and _relevant_tools is not None and mcp_mgr:
         from src.browser_operator import is_browser_mcp_tool_name
+        _browser_seen_in_context = False
         try:
             for _msg in reversed(messages):
-                if _msg.get("role") == "assistant":
-                    _content = _msg.get("content", "") or ""
-                    if isinstance(_content, str) and (
-                        "browser_" in _content
-                        or "mcp__" in _content
-                    ):
-                        _browser_tools = {
-                            t["qualified_name"] if t.get("qualified_name")
-                            else f"mcp__{t['server_id']}__{t['name']}"
-                            for t in mcp_mgr.get_all_tools(_mcp_disabled_map)
-                            if is_browser_mcp_tool_name(t.get("name", ""))
-                        }
-                        _relevant_tools.update(_browser_tools)
-                        logger.info("[tool-rag] Follow-up browser pin: added %d browser tools", len(_browser_tools))
+                _content = _msg.get("content", "") or ""
+                if isinstance(_content, str) and (
+                    "browser_" in _content
+                    or "mcp__builtin_browser__" in _content
+                ):
+                    _browser_seen_in_context = True
                     break
-        except Exception as _exc:
-            logger.warning("[tool-rag] Failed follow-up browser pin: %s", _exc)
+        except Exception:
+            pass
+        if _browser_seen_in_context:
+            try:
+                _browser_tools = {
+                    t["qualified_name"] if t.get("qualified_name")
+                    else f"mcp__{t['server_id']}__{t['name']}"
+                    for t in mcp_mgr.get_all_tools(_mcp_disabled_map)
+                    if is_browser_mcp_tool_name(t.get("name", ""))
+                }
+                _relevant_tools.update(_browser_tools)
+                logger.info("[tool-rag] Follow-up browser pin: added %d browser tools", len(_browser_tools))
+            except Exception as _exc:
+                logger.warning("[tool-rag] Failed follow-up browser pin: %s", _exc)
 
     # If a document is open the model needs the editing tools available
     # regardless of which selection path (RAG, keyword, caller-provided) ran
@@ -2249,7 +2277,7 @@ async def stream_agent_loop(
         else:
             # Local: only MCP schemas when message suggests MCP tool usage
             _last_content = _last_user.lower()
-            _wants_mcp = any(kw in _last_content for kw in _MCP_KEYWORDS)
+            _wants_mcp = any(re.search(rf"\b{re.escape(kw)}\b", _last_content) for kw in _MCP_KEYWORDS) if _last_content else False
             all_tool_schemas = mcp_schemas if (_wants_mcp and mcp_schemas) else []
             # Report why tool-reliant features are unavailable for this model/endpoint.
             _email_tools_wanted = (

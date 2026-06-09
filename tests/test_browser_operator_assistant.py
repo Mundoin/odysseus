@@ -957,3 +957,82 @@ def test_merge_safe_fill_verification_marks_success_and_unknown_not_success():
     assert report["succeeded_count"] == 1
     assert report["unknown_count"] == 1
     assert report["filled"][1]["status"] == "unknown"
+
+
+# ── Safe fill bridge tool discovery ────────────────────────────────────────
+
+def test_fill_bridge_discover_browser_tool_names():
+    """Verify _discover_browser_tool finds the correct tool name from MCP."""
+    from types import SimpleNamespace
+    from src.browser_operator import _discover_browser_tool
+
+    fake_mgr = SimpleNamespace()
+    fake_mgr.get_all_tools = lambda: [
+        {"name": "browser_snapshot", "server_id": "builtin_browser",
+         "qualified_name": "mcp__builtin_browser__browser_snapshot"},
+        {"name": "browser_fill", "server_id": "builtin_browser",
+         "qualified_name": "mcp__builtin_browser__browser_fill"},
+        {"name": "browser_type", "server_id": "builtin_browser",
+         "qualified_name": "mcp__builtin_browser__browser_type"},
+    ]
+
+    # Should find browser_fill via qualified name
+    result = _discover_browser_tool(fake_mgr, ("browser_fill", "browser_type", "some_other"), fallback="fallback", tool_kind="fill")
+    assert result == "mcp__builtin_browser__browser_fill", f"Expected qualified name, got {result}"
+
+    # Should find browser_type
+    result = _discover_browser_tool(fake_mgr, ("browser_type",), fallback="fallback", tool_kind="type")
+    assert result == "mcp__builtin_browser__browser_type"
+
+    # Should fall back when no candidates match
+    result = _discover_browser_tool(fake_mgr, ("nonexistent_tool",), fallback="mcp__builtin_browser__browser_fill", tool_kind="fill")
+    assert result == "mcp__builtin_browser__browser_fill"
+
+    # Should fall back when no mcp_mgr
+    result = _discover_browser_tool(None, ("browser_fill",), fallback="mcp__builtin_browser__browser_fill", tool_kind="fill")
+    assert result == "mcp__builtin_browser__browser_fill"
+
+
+def test_fill_bridge_uses_discovered_tool_names():
+    """build_safe_browser_fill_calls should use discovered names when mcp_mgr is provided."""
+    from types import SimpleNamespace
+    from src.browser_operator import build_safe_browser_fill_calls
+
+    fake_mgr = SimpleNamespace()
+    fake_mgr.get_all_tools = lambda: [
+        {"name": "browser_snapshot", "server_id": "builtin_browser",
+         "qualified_name": "mcp__builtin_browser__browser_snapshot"},
+        {"name": "browser_fill", "server_id": "builtin_browser",
+         "qualified_name": "mcp__builtin_browser__browser_fill"},
+        {"name": "browser_type", "server_id": "builtin_browser",
+         "qualified_name": "mcp__builtin_browser__browser_type"},
+    ]
+
+    form_plan = {
+        "page_url": "http://test.com",
+        "page_title": "Test",
+        "fill_steps": [
+            {"field_ref": "name", "label": "Name", "field_type": "text",
+             "direction": "fill", "confidence": "high",
+             "safe_to_fill": True,
+             "value_preview_redacted": "Bujar",
+             "value_source": "known_values.name"},
+        ],
+        "safe_fill_count": 1,
+        "skipped": [],
+        "blocked_actions": [],
+        "upload_steps": [],
+        "missing_values": [],
+        "sensitive_values": [],
+    }
+
+    bridge = build_safe_browser_fill_calls(
+        form_plan, known_values={"name": "Bujar"}, mcp_mgr=fake_mgr
+    )
+
+    # The fill_tool_name should be the discovered qualified name
+    assert bridge["batches"]
+    call = bridge["batches"][0][0]
+    assert call["tool_name"] == "mcp__builtin_browser__browser_fill", (
+        f"Expected discovered fill tool, got {call['tool_name']}"
+    )
