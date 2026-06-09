@@ -22,7 +22,11 @@ from src.prompt_security import untrusted_context_message
 from src.tool_security import blocked_tools_for_owner, plan_mode_disabled_tools
 from src.tool_policy import GUIDE_ONLY_DIRECTIVE, ToolPolicy
 from src.tool_utils import get_mcp_manager
-from src.browser_operator import format_browser_observation, format_confirmation_preview
+from src.browser_operator import (
+    confirmation_preview_for_event,
+    format_browser_observation,
+    format_confirmation_preview,
+)
 from src.agent_tools import (
     parse_tool_blocks,
     strip_tool_blocks,
@@ -2801,7 +2805,7 @@ async def stream_agent_loop(
             if "diff" in result:
                 tool_output_data["diff"] = result["diff"]
             if result.get("pending_confirmation"):
-                tool_output_data["confirmation_preview"] = result
+                tool_output_data["confirmation_preview"] = confirmation_preview_for_event(result)
             yield f'data: {json.dumps(tool_output_data)}\n\n'
 
             # Native document tools open in the editor + carry the REAL doc id.
@@ -2862,7 +2866,7 @@ async def stream_agent_loop(
             if result.get("diff"):
                 tool_event["diff"] = result["diff"]
             if result.get("pending_confirmation"):
-                tool_event["confirmation_preview"] = result
+                tool_event["confirmation_preview"] = confirmation_preview_for_event(result)
             tool_events.append(tool_event)
             if block.tool_type in _VERIFIER_EFFECTFUL_TOOLS:
                 _effectful_used = True

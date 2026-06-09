@@ -24,8 +24,17 @@ from src.tool_security import is_public_blocked_tool, owner_is_admin_or_single_u
 from src.tool_policy import ToolPolicy
 from src.constants import MAX_OUTPUT_CHARS, MAX_READ_CHARS, MAX_DIFF_LINES, DATA_DIR
 from src.tool_utils import _truncate, get_mcp_manager
+from src.external_action_guard import classify_mcp_tool as _classify_mcp_tool
 from src.external_action_guard import guard_mcp as _ext_guard_mcp
-from src.browser_operator import format_browser_observation, format_confirmation_preview
+from src.browser_operator import (
+    browser_action_scope,
+    consume_browser_pending_action,
+    format_browser_observation,
+    format_confirmation_preview,
+    is_browser_mcp_tool_name,
+    mark_browser_approval_mismatch,
+    record_browser_pending_action,
+)
 
 # Persistent working directory for agent subprocesses.
 # Resolves to <repo_root>/data, which is the bind-mounted volume in Docker
@@ -778,8 +787,27 @@ async def execute_tool_block(
             except (json.JSONDecodeError, TypeError):
                 args = {}
             _confirmed = bool(args.pop("confirmed", False))
-            _block = _ext_guard_mcp(tool, args, _confirmed)
             desc = f"mcp: {tool}"
+            _block = None
+            if is_browser_mcp_tool_name(tool) and _classify_mcp_tool(tool, args) not in ("safe_read", "local_prepare"):
+                _scope = browser_action_scope(session_id=session_id, owner=owner)
+                if _confirmed:
+                    if consume_browser_pending_action(_scope, tool, args):
+                        _block = _ext_guard_mcp(tool, args, True)
+                    else:
+                        fresh = _ext_guard_mcp(tool, args, False)
+                        _block = mark_browser_approval_mismatch(
+                            record_browser_pending_action(_scope, tool, args, fresh or {})
+                        )
+                else:
+                    fresh = _ext_guard_mcp(tool, args, False)
+                    _block = (
+                        record_browser_pending_action(_scope, tool, args, fresh)
+                        if fresh is not None
+                        else None
+                    )
+            else:
+                _block = _ext_guard_mcp(tool, args, _confirmed)
             if _block is not None:
                 result = _block
             else:
@@ -811,6 +839,7 @@ _FORMATTER_HANDLED_KEYS = {
     "consequences", "risk", "instruction", "approval_instruction",
     "body_preview", "arguments_preview", "high_impact", "high_impact_reason",
     "final_checklist", "final_review_checklist", "integration", "url",
+    "action_fingerprint", "preview_id", "approval_mismatch",
 }
 
 

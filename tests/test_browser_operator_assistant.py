@@ -98,7 +98,9 @@ async def test_safe_browser_action_dispatches_through_execute_tool_block(monkeyp
         content="{}",
     )
 
-    desc, result = await te.execute_tool_block(block, owner="bujar")
+    desc, result = await te.execute_tool_block(
+        block, owner="bujar", session_id="browser-session-1"
+    )
 
     assert desc == "mcp: mcp__builtin_browser__browser_snapshot"
     assert result["content"].startswith("called")
@@ -117,7 +119,7 @@ async def test_risky_browser_action_returns_pending_confirmation_without_dispatc
         content='{"element": "Buy now"}',
     )
 
-    desc, result = await te.execute_tool_block(block, owner="bujar")
+    desc, result = await te.execute_tool_block(block, owner="bujar", session_id="browser-session-1")
 
     assert desc == "mcp: mcp__builtin_browser__browser_click"
     assert result["pending_confirmation"] is True
@@ -126,23 +128,171 @@ async def test_risky_browser_action_returns_pending_confirmation_without_dispatc
     assert result["action_name"] == "browser_click"
     assert result["target"] == "Buy now"
     assert result["high_impact"] is True
+    assert result["action_fingerprint"]
+    assert result["preview_id"].startswith("browser-action:")
     assert fake_mcp.calls == []
 
 
 @pytest.mark.asyncio
-async def test_approved_browser_retry_dispatches_with_confirmed_stripped(monkeypatch):
+async def test_approved_browser_retry_dispatches_after_matching_preview(monkeypatch):
     import src.tool_execution as te
+    from src.browser_operator import clear_browser_pending_actions
 
+    clear_browser_pending_actions()
     fake_mcp = _FakeMcp()
     monkeypatch.setattr(te, "get_mcp_manager", lambda: fake_mcp)
     monkeypatch.setattr(te, "_owner_is_admin", lambda owner: True)
+    preview_block = SimpleNamespace(
+        tool_type="mcp__builtin_browser__browser_click",
+        content='{"element": "Buy now"}',
+    )
     block = SimpleNamespace(
         tool_type="mcp__builtin_browser__browser_click",
         content='{"element": "Buy now", "confirmed": true}',
     )
 
-    desc, result = await te.execute_tool_block(block, owner="bujar")
+    preview_desc, preview_result = await te.execute_tool_block(
+        preview_block, owner="bujar", session_id="browser-session-1"
+    )
+    desc, result = await te.execute_tool_block(
+        block, owner="bujar", session_id="browser-session-1"
+    )
 
+    assert preview_desc == "mcp: mcp__builtin_browser__browser_click"
+    assert preview_result["pending_confirmation"] is True
     assert desc == "mcp: mcp__builtin_browser__browser_click"
     assert "pending_confirmation" not in result
     assert fake_mcp.calls == [("mcp__builtin_browser__browser_click", {"element": "Buy now"})]
+
+
+@pytest.mark.asyncio
+async def test_confirmed_browser_action_without_prior_preview_fails_closed(monkeypatch):
+    import src.tool_execution as te
+    from src.browser_operator import clear_browser_pending_actions
+
+    clear_browser_pending_actions()
+    fake_mcp = _FakeMcp()
+    monkeypatch.setattr(te, "get_mcp_manager", lambda: fake_mcp)
+    monkeypatch.setattr(te, "_owner_is_admin", lambda owner: True)
+    block = SimpleNamespace(
+        tool_type="mcp__builtin_browser__browser_click",
+        content='{"element": "Delete account", "confirmed": true}',
+    )
+
+    _desc, result = await te.execute_tool_block(block, owner="bujar", session_id="browser-session-2")
+
+    assert result["pending_confirmation"] is True
+    assert "No matching pending browser approval" in result["approval_instruction"]
+    assert fake_mcp.calls == []
+
+
+@pytest.mark.asyncio
+async def test_confirmed_browser_action_with_changed_args_is_blocked(monkeypatch):
+    import src.tool_execution as te
+    from src.browser_operator import clear_browser_pending_actions
+
+    clear_browser_pending_actions()
+    fake_mcp = _FakeMcp()
+    monkeypatch.setattr(te, "get_mcp_manager", lambda: fake_mcp)
+    monkeypatch.setattr(te, "_owner_is_admin", lambda owner: True)
+
+    preview_block = SimpleNamespace(
+        tool_type="mcp__builtin_browser__browser_click",
+        content='{"element": "Buy now"}',
+    )
+    changed_block = SimpleNamespace(
+        tool_type="mcp__builtin_browser__browser_click",
+        content='{"element": "Buy later", "confirmed": true}',
+    )
+
+    _preview_desc, preview = await te.execute_tool_block(
+        preview_block, owner="bujar", session_id="browser-session-3"
+    )
+    _changed_desc, changed = await te.execute_tool_block(
+        changed_block, owner="bujar", session_id="browser-session-3"
+    )
+
+    assert changed["pending_confirmation"] is True
+    assert changed["action_fingerprint"] != preview["action_fingerprint"]
+    assert "No matching pending browser approval" in changed["approval_instruction"]
+    assert fake_mcp.calls == []
+
+
+@pytest.mark.asyncio
+async def test_confirmed_browser_action_with_changed_target_is_blocked(monkeypatch):
+    import src.tool_execution as te
+    from src.browser_operator import clear_browser_pending_actions
+
+    clear_browser_pending_actions()
+    fake_mcp = _FakeMcp()
+    monkeypatch.setattr(te, "get_mcp_manager", lambda: fake_mcp)
+    monkeypatch.setattr(te, "_owner_is_admin", lambda owner: True)
+
+    preview_block = SimpleNamespace(
+        tool_type="mcp__builtin_browser__browser_network_request",
+        content='{"method": "POST", "url": "https://shop.example.test/cart"}',
+    )
+    changed_block = SimpleNamespace(
+        tool_type="mcp__builtin_browser__browser_network_request",
+        content='{"method": "POST", "url": "https://shop.example.test/payment", "confirmed": true}',
+    )
+
+    _preview_desc, preview = await te.execute_tool_block(
+        preview_block, owner="bujar", session_id="browser-session-4"
+    )
+    _changed_desc, changed = await te.execute_tool_block(
+        changed_block, owner="bujar", session_id="browser-session-4"
+    )
+
+    assert changed["pending_confirmation"] is True
+    assert changed["target"] == "https://shop.example.test/payment"
+    assert changed["action_fingerprint"] != preview["action_fingerprint"]
+    assert fake_mcp.calls == []
+
+
+def test_browser_observation_redacts_sensitive_values_and_separates_sections():
+    from src.browser_operator import format_browser_observation
+
+    text = format_browser_observation(
+        "mcp__builtin_browser__browser_snapshot",
+        {
+            "content": (
+                "Title: Checkout\n"
+                "URL: https://shop.example.test\n"
+                "Visible: password: hunter2 token=abc123 4111 1111 1111 1111\n"
+                "Buttons: Submit payment"
+            )
+        },
+    )
+
+    assert "Observed page facts:" in text
+    assert "Inferred next steps:" in text
+    assert "Risky actions requiring approval:" in text
+    assert "hunter2" not in text
+    assert "abc123" not in text
+    assert "4111 1111 1111 1111" not in text
+    assert "[REDACTED" in text
+
+
+def test_confirmation_preview_event_payload_redacts_sensitive_values():
+    from src.browser_operator import confirmation_preview_for_event
+
+    event = confirmation_preview_for_event(
+        {
+            "pending_confirmation": True,
+            "tool_name": "mcp__builtin_browser__browser_fill_form",
+            "action_name": "browser_fill_form",
+            "target": "checkout form",
+            "summary": "Fill password: hunter2 and token=abc123",
+            "arguments_preview": {"password": "hunter2", "card_number": "4111111111111111"},
+            "action_fingerprint": "abc",
+            "preview_id": "browser-action:abc",
+        }
+    )
+
+    rendered = str(event)
+    assert event["action_fingerprint"] == "abc"
+    assert event["preview_id"] == "browser-action:abc"
+    assert "hunter2" not in rendered
+    assert "abc123" not in rendered
+    assert "4111111111111111" not in rendered
