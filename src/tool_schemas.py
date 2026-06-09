@@ -1045,14 +1045,15 @@ FUNCTION_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "send_email",
-            "description": "Send a new email. Use resolve_contact first if you only have a name and need to find the email address. If multiple accounts exist, pass account from list_email_accounts.",
+            "description": "Send a new email. Always call list_email_accounts first to get the account name, then pass it here. Use resolve_contact first if you only have a name and need to find the email address. Two-step: first call returns a preview requiring confirmation; re-call with confirmed=true to actually send.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "to": {"type": "string", "description": "Recipient email address"},
                     "subject": {"type": "string", "description": "Email subject line"},
                     "body": {"type": "string", "description": "Email body text"},
-                    "account": {"type": "string", "description": "Optional account name/email/id from list_email_accounts, e.g. Gmail or user@example.com"},
+                    "account": {"type": "string", "description": "Account name/email/id from list_email_accounts (e.g. Gmail or user@example.com). Required when multiple accounts exist."},
+                    "confirmed": {"type": "boolean", "description": "Set to true to confirm and actually send the email. First call without confirmed returns a preview; re-call with confirmed=true to execute."},
                 },
                 "required": ["to", "subject", "body"]
             }
@@ -1096,14 +1097,15 @@ FUNCTION_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "reply_to_email",
-            "description": "SEND a reply email immediately by UID. Do not use this when the user asks to open/start a reply window or draft; use ui_control action=open_email_reply instead. For follow-up 'reply ...' requests where the user clearly wants to send now, use the exact UID from the latest read_email/list_emails result; never invent UID 1. Automatically threads with In-Reply-To/References headers.",
+            "description": "SEND a reply email immediately by UID. Do not use this when the user asks to open/start a reply window or draft; use ui_control action=open_email_reply instead. For follow-up 'reply ...' requests where the user clearly wants to send now, use the exact UID from the latest read_email/list_emails result; never invent UID 1. Automatically threads with In-Reply-To/References headers. Two-step: first call returns a preview requiring confirmation; re-call with confirmed=true to actually send.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "uid": {"type": "string", "description": "Exact UID of the email to reply to from list_emails/read_email; never invent UID 1"},
                     "body": {"type": "string", "description": "Reply body text"},
                     "folder": {"type": "string", "description": "IMAP folder (default: INBOX)"},
-                    "account": {"type": "string", "description": "Optional account name/email/id from list_email_accounts, especially when the UID came from a non-default mailbox"},
+                    "account": {"type": "string", "description": "Account name/email/id from list_email_accounts, especially when the UID came from a non-default mailbox"},
+                    "confirmed": {"type": "boolean", "description": "Set to true to confirm and actually send the reply. First call without confirmed returns a preview; re-call with confirmed=true to execute."},
                 },
                 "required": ["uid", "body"]
             }

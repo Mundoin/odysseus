@@ -167,6 +167,65 @@ class TestFinalToolList:
 
 
 # ---------------------------------------------------------------------------
+# Schema shape: confirmed param present, not required
+# ---------------------------------------------------------------------------
+
+def _get_schema(tool_name: str) -> dict:
+    from src.tool_schemas import FUNCTION_TOOL_SCHEMAS
+    for s in FUNCTION_TOOL_SCHEMAS:
+        if s.get("function", {}).get("name") == tool_name:
+            return s["function"]
+    raise KeyError(f"{tool_name!r} not found in FUNCTION_TOOL_SCHEMAS")
+
+
+class TestEmailSchemaConfirmedParam:
+    def test_send_email_has_confirmed_property(self):
+        fn = _get_schema("send_email")
+        assert "confirmed" in fn["parameters"]["properties"], (
+            "send_email schema must expose 'confirmed' so the model can re-call with confirmed=true"
+        )
+
+    def test_send_email_confirmed_is_boolean(self):
+        fn = _get_schema("send_email")
+        assert fn["parameters"]["properties"]["confirmed"]["type"] == "boolean"
+
+    def test_send_email_confirmed_not_required(self):
+        fn = _get_schema("send_email")
+        assert "confirmed" not in fn["parameters"].get("required", []), (
+            "'confirmed' must be optional (defaults to False); first call should work without it"
+        )
+
+    def test_send_email_confirmed_description_mentions_preview(self):
+        fn = _get_schema("send_email")
+        desc = fn["parameters"]["properties"]["confirmed"]["description"].lower()
+        assert "preview" in desc or "confirm" in desc
+
+    def test_reply_to_email_has_confirmed_property(self):
+        fn = _get_schema("reply_to_email")
+        assert "confirmed" in fn["parameters"]["properties"], (
+            "reply_to_email schema must expose 'confirmed' so the model can re-call with confirmed=true"
+        )
+
+    def test_reply_to_email_confirmed_is_boolean(self):
+        fn = _get_schema("reply_to_email")
+        assert fn["parameters"]["properties"]["confirmed"]["type"] == "boolean"
+
+    def test_reply_to_email_confirmed_not_required(self):
+        fn = _get_schema("reply_to_email")
+        assert "confirmed" not in fn["parameters"].get("required", [])
+
+    def test_send_email_description_mentions_two_step(self):
+        fn = _get_schema("send_email")
+        desc = fn["description"].lower()
+        assert "confirmed=true" in desc or "two-step" in desc or "preview" in desc
+
+    def test_reply_to_email_description_mentions_two_step(self):
+        fn = _get_schema("reply_to_email")
+        desc = fn["description"].lower()
+        assert "confirmed=true" in desc or "two-step" in desc or "preview" in desc
+
+
+# ---------------------------------------------------------------------------
 # Migration script: provider classification
 # ---------------------------------------------------------------------------
 
