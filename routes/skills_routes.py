@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 
 from services.memory.skills import SkillsManager
 from src.auth_helpers import get_current_user
+from src.external_action_guard import normalize_confirmation_preview
 from core.middleware import require_admin
 
 logger = logging.getLogger(__name__)
@@ -1097,6 +1098,28 @@ def setup_skills_routes(skills_manager: SkillsManager) -> APIRouter:
         except Exception:
             logger.debug("skill_added event dispatch failed", exc_info=True)
 
+    def _confirmation_preview(preview: dict, *, action: str, target: str, arguments: Optional[dict] = None) -> dict:
+        return normalize_confirmation_preview(
+            preview,
+            tool="skills_api",
+            action_name=action,
+            action_category="local_prepare",
+            target=target,
+            target_resource=f"skill:{target}",
+            summary=(
+                f"Odysseus is about to {action} skill '{target}' in the local skill registry. "
+                "Approval is required before applying this change."
+            ),
+            consequences=(
+                "If approved, Odysseus will update the local skill registry immediately. "
+                "This changes local assistant operating instructions available in future turns."
+            ),
+            approval_instruction=preview.get("instruction"),
+            risk_level="normal",
+            high_impact=False,
+            arguments=arguments,
+        )
+
     @router.get("")
     async def list_skills(request: Request):
         user = _owner(request)
@@ -1248,13 +1271,13 @@ def setup_skills_routes(skills_manager: SkillsManager) -> APIRouter:
         user = _owner(request)
 
         if not body.confirmed:
-            return {
+            return _confirmation_preview({
                 "pending_confirmation": True,
                 "action": "import-from-url",
                 "url": body.url.strip(),
                 "warning": "This will download and install an external skill bundle.",
                 "instruction": "Re-submit with confirmed=true to execute the import.",
-            }
+            }, action="import-from-url", target=body.url.strip(), arguments={"action": "import-from-url", "url": body.url.strip()})
 
         from services.memory.skill_importer import (
             SkillImportError,
@@ -1285,14 +1308,15 @@ def setup_skills_routes(skills_manager: SkillsManager) -> APIRouter:
     async def add_skill(request: Request, body: SkillAddRequest):
         user = _owner(request)
         if not body.confirmed:
-            return {
+            target = body.name or body.title or "(unnamed)"
+            return _confirmation_preview({
                 "pending_confirmation": True,
                 "action": "add",
-                "name": body.name or body.title or "(unnamed)",
+                "name": target,
                 "description": (body.description or body.problem or "")[:200],
                 "category": body.category,
                 "instruction": "Re-submit with confirmed=true to create the skill.",
-            }
+            }, action="add", target=target, arguments={"action": "add", "name": target, "category": body.category})
         entry = skills_manager.add_skill(
             # New shape
             name=body.name,
@@ -1581,13 +1605,17 @@ def setup_skills_routes(skills_manager: SkillsManager) -> APIRouter:
         if not isinstance(new_content, str) or not new_content.strip():
             raise HTTPException(400, "markdown is required")
         if not body.get("confirmed"):
-            return {
+            return _confirmation_preview({
                 "pending_confirmation": True,
                 "action": "save-markdown",
                 "skill_id": skill_id,
                 "content_length": len(new_content),
                 "instruction": "Re-submit with confirmed=true to overwrite the skill.",
-            }
+            }, action="save-markdown", target=skill_id, arguments={
+                "action": "save-markdown",
+                "skill_id": skill_id,
+                "content_length": len(new_content),
+            })
         skills = skills_manager.load(owner=user)
         match = next((s for s in skills if s.get("name") == skill_id or s.get("id") == skill_id), None)
         if not match:
@@ -1636,12 +1664,12 @@ def setup_skills_routes(skills_manager: SkillsManager) -> APIRouter:
     async def update_skill(request: Request, skill_id: str, body: SkillUpdateRequest):
         user = _owner(request)
         if not body.confirmed:
-            return {
+            return _confirmation_preview({
                 "pending_confirmation": True,
                 "action": "update",
                 "skill_id": skill_id,
                 "instruction": "Re-submit with confirmed=true to apply the update.",
-            }
+            }, action="update", target=skill_id, arguments={"action": "update", "skill_id": skill_id})
         skills = skills_manager.load(owner=user)
         match = next((s for s in skills if s.get("name") == skill_id or s.get("id") == skill_id), None)
         if not match:
@@ -1662,13 +1690,13 @@ def setup_skills_routes(skills_manager: SkillsManager) -> APIRouter:
     async def delete_skill(request: Request, skill_id: str, confirmed: bool = False):
         user = _owner(request)
         if not confirmed:
-            return {
+            return _confirmation_preview({
                 "pending_confirmation": True,
                 "action": "delete",
                 "skill_id": skill_id,
                 "warning": "Skill directory will be permanently removed.",
                 "instruction": "Re-submit with ?confirmed=true to delete.",
-            }
+            }, action="delete", target=skill_id, arguments={"action": "delete", "skill_id": skill_id})
         skills = skills_manager.load(owner=user)
         match = next((s for s in skills if s.get("name") == skill_id or s.get("id") == skill_id), None)
         if not match:

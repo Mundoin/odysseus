@@ -115,6 +115,25 @@ class TestAddSkillGuard:
         resp = client.post("/api/skills/add", json={"name": "special-skill"})
         assert "special-skill" in resp.json().get("name", "")
 
+    def test_preview_uses_standard_confirmation_surface(self, client_sm):
+        client, sm = client_sm
+        resp = client.post("/api/skills/add", json={
+            "name": "special-skill", "description": "desc", "procedure": ["s1"],
+        })
+        data = resp.json()
+        assert data["confirmation_required"] is True
+        assert data["action_category"] == "local_prepare"
+        assert data["risk_level"] == "normal"
+        assert data["tool_name"] == "skills_api"
+        assert data["action_name"] == "add"
+        assert data["target"] == "special-skill"
+        assert data["target_resource"] == "skill:special-skill"
+        assert "special-skill" in data["summary"]
+        assert "local skill registry" in data["consequences"]
+        assert data["approval_instruction"] == data["instruction"]
+        assert data["high_impact"] is False
+        assert data["arguments_preview"]["action"] == "add"
+
 
 # ---------------------------------------------------------------------------
 # POST /api/skills/import-from-url

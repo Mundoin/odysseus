@@ -103,6 +103,15 @@ class TestApiCallPreviewQuality:
         )
         assert result["target_domain"] == "shop.example.test"
 
+    def test_url_target_yields_target_url_alias_and_explicit_high_impact_false(self):
+        from src.external_action_guard import guard
+        result = guard(
+            tool="api_call", method="POST",
+            target="https://api.example.test/messages", confirmed=False,
+        )
+        assert result["target_url"] == "https://api.example.test/messages"
+        assert result["high_impact"] is False
+
 
 # ---------------------------------------------------------------------------
 # MCP browser action previews
@@ -160,13 +169,13 @@ class TestMcpPreviewQuality:
         assert result["risk_level"] == "high"
         assert "high-impact keyword" in result["high_impact_reason"]
 
-    def test_plain_click_is_normal_risk_without_high_impact_fields(self):
+    def test_plain_click_is_normal_risk_with_explicit_high_impact_false(self):
         from src.external_action_guard import guard_mcp
         result = guard_mcp(
             "mcp__playwright__browser_click", {"element": "Open menu"}, confirmed=False
         )
         assert result["risk_level"] == "normal"
-        assert "high_impact" not in result
+        assert result["high_impact"] is False
         assert "final_review_checklist" not in result
 
     def test_network_request_preview_has_url_and_domain(self):

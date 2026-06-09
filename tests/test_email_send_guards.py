@@ -77,6 +77,35 @@ class TestMcpSendEmailGuards:
         assert result["subject"] == "Test subject"
         assert "instruction" in result
 
+    def test_unconfirmed_preview_uses_standard_confirmation_surface(self):
+        fake_cfg = _make_fake_cfg()
+        with patch("mcp_servers.email_server._resolve_send_config", return_value=("acc-1", fake_cfg)):
+            _send_email, _ = self._import_send_email()
+            result = _send_email(
+                to="dest@example.com",
+                subject="Test subject",
+                body="Hello world",
+                account="work",
+                confirmed=False,
+            )
+        assert result["confirmation_required"] is True
+        assert result["action_category"] == "high_impact_external_write"
+        assert result["risk_level"] == "high"
+        assert result["tool_name"] == "send_email"
+        assert result["action_name"] == "send_email"
+        assert result["target"] == "dest@example.com"
+        assert result["target_resource"] == "email:dest@example.com"
+        assert "send email" in result["summary"].lower()
+        assert "dest@example.com" in result["summary"]
+        assert "work@example.com" in result["summary"]
+        assert "externally visible" in result["consequences"]
+        assert "confirmed=true" in result["approval_instruction"]
+        assert result["approval_instruction"] == result["instruction"]
+        assert result["high_impact"] is True
+        assert "email" in result["high_impact_reason"].lower()
+        assert isinstance(result["final_review_checklist"], list)
+        assert result["arguments_preview"]["subject"] == "Test subject"
+
     def test_unconfirmed_body_preview_truncated(self):
         """Body longer than 500 chars must be truncated in preview."""
         fake_cfg = _make_fake_cfg()

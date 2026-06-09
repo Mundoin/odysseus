@@ -74,6 +74,68 @@ def _compact_args(value: Any, depth: int = 0) -> Any:
     return value
 
 
+def normalize_confirmation_preview(
+    preview: dict,
+    *,
+    tool: str,
+    action_name: str,
+    action_category: str,
+    target: str,
+    summary: str,
+    consequences: str,
+    approval_instruction: str | None = None,
+    risk_level: str | None = None,
+    high_impact: bool | None = None,
+    high_impact_reason: str | None = None,
+    target_url: str | None = None,
+    target_resource: str | None = None,
+    arguments: Any = None,
+    final_review_checklist: list[str] | None = None,
+) -> dict:
+    """Add the standard human-readable confirmation surface to a preview.
+
+    Existing preview keys are left intact for compatibility. Callers may pass
+    bespoke legacy fields first, then normalize the shared operator-facing
+    fields here.
+    """
+    high = bool(high_impact) if high_impact is not None else risk_level == "high"
+    instruction = approval_instruction or (
+        "Show this preview to the user and ask for explicit approval before proceeding. "
+        "If approved, re-call with confirmed=true to execute."
+    )
+    preview.setdefault("pending_confirmation", True)
+    preview.setdefault("confirmation_required", True)
+    preview.setdefault("tool_name", tool)
+    preview.setdefault("action_name", action_name)
+    preview.setdefault("action_category", action_category)
+    preview.setdefault("risk_level", risk_level or ("high" if high else "normal"))
+    preview.setdefault("target", target)
+    preview.setdefault("summary", summary)
+    preview.setdefault("consequences", consequences)
+    preview.setdefault("instruction", instruction)
+    preview.setdefault("approval_instruction", preview["instruction"])
+    preview.setdefault("high_impact", high)
+    if target_url:
+        preview.setdefault("target_url", target_url)
+        preview.setdefault("url", target_url)
+    domain = _extract_domain(target_url, target)
+    if domain:
+        preview.setdefault("target_domain", domain)
+    if target_resource:
+        preview.setdefault("target_resource", target_resource)
+    if arguments is not None:
+        preview.setdefault("arguments_preview", _compact_args(arguments))
+    if high:
+        preview.setdefault(
+            "high_impact_reason",
+            high_impact_reason
+            or "action is classified as financially, legally, destructive, or security-sensitive",
+        )
+        if final_review_checklist is not None:
+            preview.setdefault("final_review_checklist", final_review_checklist)
+    return preview
+
+
 def build_preview(
     *,
     tool: str,
@@ -111,29 +173,16 @@ def build_preview(
         else "If approved, Odysseus will execute this action immediately. It will change "
         "external or server-side state and cannot be undone automatically."
     )
-    approval_instruction = (
-        "Show this preview to the user and ask for explicit approval before proceeding. "
-        "Re-call with confirmed=true to execute."
-    )
     preview: dict[str, Any] = {
         # primary signal (legacy consumers key on pending_confirmation)
         "pending_confirmation": True,
-        "confirmation_required": True,
         # what / where
         "tool": tool,
-        "tool_name": tool,
-        "action_name": action,
         "action_type": action_class,
-        "action_category": action_class,
-        "risk_level": "high" if high else "normal",
         "method": method.upper(),
         "target": target,
         # operator-facing narrative
-        "summary": summary,
-        "consequences": consequences,
         "risk": risk,
-        "instruction": approval_instruction,
-        "approval_instruction": approval_instruction,
     }
     if domain:
         preview["target_domain"] = domain
@@ -143,7 +192,6 @@ def build_preview(
         preview["integration"] = integration
     if body is not None:
         preview["body_preview"] = body
-        preview["arguments_preview"] = _compact_args(body)
     if high:
         if not high_impact_reason:
             kws = _matched_high_impact_keywords(target)
@@ -152,8 +200,6 @@ def build_preview(
                 if kws
                 else "action is classified as financially, legally, destructive, or security-sensitive"
             )
-        preview["high_impact"] = True
-        preview["high_impact_reason"] = high_impact_reason
         preview["final_checklist"] = {
             "target": target,
             "method": method.upper(),
@@ -162,14 +208,32 @@ def build_preview(
             "financial_impact": "unknown — review before confirming",
             "legal_consequence": "unknown — review before confirming",
         }
-        preview["final_review_checklist"] = [
+    target_url = url or (target if isinstance(target, str) and target.startswith(("http://", "https://")) else None)
+    return normalize_confirmation_preview(
+        preview,
+        tool=tool,
+        action_name=action,
+        action_category=action_class,
+        target=target,
+        summary=summary,
+        consequences=consequences,
+        approval_instruction=(
+            "Show this preview to the user and ask for explicit approval before proceeding. "
+            "If approved, re-call with confirmed=true to execute."
+        ),
+        risk_level="high" if high else "normal",
+        high_impact=high,
+        high_impact_reason=high_impact_reason,
+        target_url=target_url,
+        arguments=body,
+        final_review_checklist=[
             f"Target is correct: {target}",
             f"Action is intended: {action} ({action_class})",
             "Data being sent has been reviewed (see arguments_preview)",
             "Financial, legal, or destructive impact is understood and acceptable",
             "The user explicitly requested this action",
-        ]
-    return preview
+        ] if high else None,
+    )
 
 
 def guard(

@@ -918,7 +918,16 @@ def _send_email(to, subject, body, in_reply_to=None, references=None, cc=None, b
         )
     send_account, cfg = _resolve_send_config(account)
     if not confirmed:
-        return {
+        from src.external_action_guard import normalize_confirmation_preview
+        recipients_preview = {
+            "to": to,
+            "cc": cc,
+            "bcc": bcc,
+            "subject": subject,
+            "account": cfg.get("account_name"),
+            "from": cfg.get("from_address"),
+        }
+        preview = {
             "pending_confirmation": True,
             "from": cfg.get("from_address"),
             "account": cfg.get("account_name"),
@@ -933,6 +942,35 @@ def _send_email(to, subject, body, in_reply_to=None, references=None, cc=None, b
                 "If approved, call send_email again with confirmed=true and the same parameters."
             ),
         }
+        return normalize_confirmation_preview(
+            preview,
+            tool="send_email",
+            action_name="send_email",
+            action_category="high_impact_external_write",
+            target=str(to),
+            target_resource=f"email:{to}",
+            summary=(
+                f"Odysseus is about to send email from {cfg.get('from_address')} "
+                f"to {to} using tool send_email. Approval is required before delivery."
+            ),
+            consequences=(
+                "If approved, Odysseus will deliver this externally visible email immediately. "
+                "Recipients may read, forward, or act on the message, and delivery cannot be "
+                "automatically reversed."
+            ),
+            approval_instruction=preview["instruction"],
+            risk_level="high",
+            high_impact=True,
+            high_impact_reason="sends externally visible email content to recipient(s)",
+            arguments=recipients_preview,
+            final_review_checklist=[
+                f"Sender account is correct: {cfg.get('account_name') or cfg.get('from_address')}",
+                f"Recipients are correct: {to}",
+                f"Subject is intended: {subject}",
+                "Message body has been reviewed",
+                "The user explicitly approved sending this email",
+            ],
+        )
     msg = EmailMessage()
     msg["From"] = _clean_header_value(cfg["from_address"])
     msg["To"] = _clean_header_value(to if isinstance(to, str) else ", ".join(to))

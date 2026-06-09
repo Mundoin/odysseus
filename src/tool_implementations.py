@@ -655,6 +655,7 @@ async def do_manage_skills(content: str, owner: Optional[str] = None) -> Dict:
 
     _mutating = action in ("add", "edit", "patch", "publish", "delete")
     if _mutating and not args.get("confirmed"):
+        from src.external_action_guard import normalize_confirmation_preview
         _preview: Dict = {
             "pending_confirmation": True,
             "action": action,
@@ -676,7 +677,27 @@ async def do_manage_skills(content: str, owner: Optional[str] = None) -> Dict:
             "Show this preview to the user and ask for explicit approval. "
             "Re-call with confirmed=true to execute."
         )
-        return _preview
+        _target = name or "(not set)"
+        return normalize_confirmation_preview(
+            _preview,
+            tool="manage_skills",
+            action_name=action,
+            action_category="local_prepare",
+            target=_target,
+            target_resource=f"skill:{_target}",
+            summary=(
+                f"Odysseus is about to {action} skill '{_target}' in the local skill registry. "
+                "Approval is required before applying this change."
+            ),
+            consequences=(
+                "If approved, Odysseus will update the local skill registry immediately. "
+                "This changes local assistant operating instructions available in future turns."
+            ),
+            approval_instruction=_preview["instruction"],
+            risk_level="normal",
+            high_impact=False,
+            arguments={k: v for k, v in args.items() if k != "confirmed"},
+        )
 
     if action == "add":
         if not name:

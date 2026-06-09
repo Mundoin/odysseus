@@ -148,6 +148,24 @@ class TestMutatingActionsPreview:
         assert "instruction" in result
         assert "confirmed=true" in result["instruction"]
 
+    @pytest.mark.asyncio
+    async def test_preview_uses_standard_confirmation_surface(self):
+        sm = _fake_sm()
+        result = await _call(_args(action="delete", name="old-skill"), sm)
+        assert result["confirmation_required"] is True
+        assert result["action_category"] == "local_prepare"
+        assert result["risk_level"] == "normal"
+        assert result["tool_name"] == "manage_skills"
+        assert result["action_name"] == "delete"
+        assert result["target"] == "old-skill"
+        assert result["target_resource"] == "skill:old-skill"
+        assert "delete" in result["summary"].lower()
+        assert "old-skill" in result["summary"]
+        assert "local skill registry" in result["consequences"]
+        assert result["approval_instruction"] == result["instruction"]
+        assert result["high_impact"] is False
+        assert result["arguments_preview"]["action"] == "delete"
+
 
 # ---------------------------------------------------------------------------
 # Mutating actions with confirmed=true — must execute
