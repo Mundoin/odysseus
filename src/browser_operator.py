@@ -18,6 +18,17 @@ BROWSER_OPERATOR_RULES = """\
 - If a browser action returns `pending_confirmation`, show the preview to the user and wait. Only after explicit current-chat approval should you retry the same MCP tool with `confirmed=true` and the same action arguments.
 - After a confirmed browser action, report what happened from the tool result; do not claim success if the browser/MCP tool failed or was unavailable."""
 
+BROWSER_OPERATOR_UNAVAILABLE = """\
+Browser automation runtime is not connected. Browser tools such as browser_snapshot, browser_navigate, browser_fill, and browser_click are unavailable until a browser MCP server (e.g., @playwright/mcp) is connected and running.
+
+To enable browser automation:
+1. Ensure npx and Node.js are installed.
+2. Cache the Playwright MCP package: npx -y @playwright/mcp@latest --version
+3. Restart Odysseus. The built-in Browser MCP server starts automatically when the package is cached.
+4. Verify in Settings → MCP Servers that 'Built-in: Browser' shows as connected.
+
+After these steps, browser tools will appear in the available tool list for the next agent request."""
+
 
 _PENDING_BROWSER_ACTIONS: dict[str, set[str]] = {}
 _SENSITIVE_KEYWORDS = (

@@ -269,6 +269,14 @@ _DOMAIN_RULES = {
 - Use `manage_settings` for preferences and tool enable/disable.
 - Use named tools over `app_api` when a named wrapper exists.
 - `app_api` is only for safe UI/API actions without a named tool; do not use it for shell, package installs, engine rebuilds, or sensitive auth/admin paths.""",
+    "browser": """\
+## Browser operator rules
+- Browser automation tools are MCP-provided; their names start with `browser_` or `mcp__`.
+- Before any browser action, inspect the current page with a snapshot/screenshot tool first.
+- Read-only tools (snapshot, screenshot, console/network inspection) are always allowed.
+- Filling safe text-like fields is allowed as local prepare. Stop before any submit/upload/apply/payment/send action.
+- If a browser tool returns `pending_confirmation`, show the preview to the user and wait for explicit chat approval. Only then retry with `confirmed=true`.
+- If the browser runtime is not connected, say "Browser automation runtime is not connected" and list the missing setup (npx @playwright/mcp must be cached). Do not pretend browser tools exist.""",
 }
 
 _DOMAIN_TOOL_MAP = {
@@ -281,13 +289,17 @@ _DOMAIN_TOOL_MAP = {
     "sessions": {"create_session", "list_sessions", "manage_session", "send_to_session", "search_chats"},
     "files": {"bash", "python", "read_file", "write_file", "edit_file", "grep", "glob", "ls"},
     "settings": {"manage_settings", "manage_endpoints", "manage_mcp", "manage_webhooks", "manage_tokens", "app_api"},
+    "browser": set(),  # browser tools are MCP-provided and matched by name prefix
 }
 
 def _domain_rules_for_tools(tool_names: set) -> list[str]:
     names = set(tool_names or set())
     rules = []
     for domain, domain_tools in _DOMAIN_TOOL_MAP.items():
-        if names & domain_tools:
+        if domain == "browser":
+            if any("browser_" in n for n in names):
+                rules.append(_DOMAIN_RULES[domain])
+        elif names & domain_tools:
             rules.append(_DOMAIN_RULES[domain])
     if names & {"create_session", "list_sessions", "manage_session", "manage_documents", "manage_notes", "manage_calendar", "manage_tasks", "manage_skills", "manage_research"}:
         rules.append(_LINK_RULES)
@@ -798,6 +810,8 @@ def _classify_agent_request(messages: List[Dict], last_user: str) -> Dict[str, o
         domains.add("files")
     if has(r"\b(endpoint|api token|mcp|webhook|preference|configure|config|setting)\b"):
         domains.add("settings")
+    if has(r"\b(browser|browse|navigate to|open browser|browser automation|browser tools|browser snapshot|page snapshot|fill form|autofill|playwright|inspect page|inspect browser|browser fill|browser click|browser type)\b"):
+        domains.add("browser")
 
     low_signal = not continuation and not domains
     return {
@@ -1342,6 +1356,30 @@ def _build_base_prompt(
         mcp_desc = mcp_mgr.get_tool_descriptions_for_prompt(mcp_disabled_map or {})
         if mcp_desc:
             agent_prompt += mcp_desc
+
+    # Inject browser operator runtime diagnostic
+    if mcp_mgr:
+        try:
+            browser_status = mcp_mgr.get_browser_operator_status()
+            if browser_status.get("browser_ready"):
+                tool_list = browser_status.get("tools", [])
+                agent_prompt += (
+                    "\n\n## Browser automation runtime\n"
+                    "Browser automation tools are CONNECTED and available.\n"
+                    f"Exposed browser tools ({len(tool_list)}): "
+                    + ", ".join(f"`{t}`" for t in tool_list[:12])
+                    + ("..." if len(tool_list) > 12 else "")
+                    + "\n\nUse `browser_snapshot` or equivalent inspection tool before planning any browser action. "
+                    "Safe text-like field fills are allowed. Submit/upload/apply/payment/send/delete/account actions "
+                    "require explicit current-chat approval."
+                )
+            elif browser_status.get("servers"):
+                agent_prompt += (
+                    "\n\n## Browser automation runtime\n"
+                    + browser_status.get("missing_runtime_message", "")
+                )
+        except Exception:
+            pass
 
     return agent_prompt, skill_index_block
 

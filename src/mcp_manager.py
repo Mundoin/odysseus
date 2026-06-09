@@ -618,6 +618,93 @@ class McpManager:
         """Get connection statuses for all servers."""
         return dict(self._connections)
 
+    def get_browser_operator_status(self) -> Dict:
+        """Return a diagnostic summary of the browser automation runtime.
+
+        Returns a dict with:
+          - browser_ready: bool — whether at least one browser MCP server is connected
+          - servers: list of {server_id, name, status, tool_count} for browser servers
+          - tools: list of browser-prefixed tool names that are currently exposed
+          - missing_runtime_message: str — user-facing message when no browser runtime is connected
+          - configured: bool — whether any browser MCP server is configured (even if not connected)
+        """
+        from src.browser_operator import is_browser_mcp_tool_name, BROWSER_OPERATOR_UNAVAILABLE
+
+        browser_servers = []
+        all_browser_tools: List[str] = []
+        configured = False
+
+        for server_id, conn in self._connections.items():
+            name = conn.get("name", server_id)
+            is_browser = (
+                "browser" in name.lower()
+                or "playwright" in name.lower()
+                or "browser" in server_id.lower()
+                or "playwright" in server_id.lower()
+            )
+            if not is_browser:
+                continue
+            configured = True
+            tools = self._tools.get(server_id, [])
+            browser_tool_names = [
+                t["name"] for t in tools
+                if is_browser_mcp_tool_name(t.get("name", ""))
+            ]
+            all_browser_tools.extend(browser_tool_names)
+            browser_servers.append({
+                "server_id": server_id,
+                "name": name,
+                "status": conn.get("status", "unknown"),
+                "tool_count": len(browser_tool_names),
+            })
+
+        # Also check for any non-dedicated server that exposes browser tools
+        for server_id, tools in self._tools.items():
+            if server_id in {s["server_id"] for s in browser_servers}:
+                continue
+            browser_tool_names = [
+                t["name"] for t in tools
+                if is_browser_mcp_tool_name(t.get("name", ""))
+            ]
+            if browser_tool_names:
+                conn = self._connections.get(server_id, {})
+                all_browser_tools.extend(browser_tool_names)
+                browser_servers.append({
+                    "server_id": server_id,
+                    "name": conn.get("name", server_id),
+                    "status": conn.get("status", "unknown"),
+                    "tool_count": len(browser_tool_names),
+                })
+
+        browser_ready = any(
+            s["status"] == "connected" and s["tool_count"] > 0
+            for s in browser_servers
+        )
+
+        if not browser_ready:
+            missing_runtime_message = BROWSER_OPERATOR_UNAVAILABLE
+            if not configured:
+                missing_runtime_message += (
+                    "\nNo browser MCP server is configured. "
+                    "Add one via Settings → MCP Servers: command=npx, "
+                    "args=-y @playwright/mcp@latest --headless --caps vision"
+                )
+            else:
+                offline = [s for s in browser_servers if s["status"] != "connected"]
+                if offline:
+                    names = ", ".join(s["name"] for s in offline)
+                    missing_runtime_message += f"\nBrowser server(s) not connected: {names}"
+        else:
+            missing_runtime_message = ""
+
+        return {
+            "browser_ready": browser_ready,
+            "servers": browser_servers,
+            "tools": all_browser_tools,
+            "missing_runtime_message": missing_runtime_message,
+            "configured": configured,
+        }
+
     _cached_prompt_desc = None
     _cached_prompt_desc_key = None
 

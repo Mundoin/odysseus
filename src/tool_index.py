@@ -425,6 +425,20 @@ class ToolIndex:
                    "make it light", "make the ui", "switch theme", "change theme",
                    "dark mode", "light mode", "toggle"}):
             {"ui_control"},
+        # Browser automation intent — user asks to drive a browser, fill a
+        # form, inspect a page, or use any browser automation capability.
+        frozenset({"browser", "browse", "navigate", "goto", "go to",
+                   "open browser", "browser automation", "browser tools",
+                   "browser snapshot", "browser page", "page snapshot",
+                   "accessibility snapshot", "inspect page", "inspect browser",
+                   "browser navigate", "browser fill", "form fill",
+                   "browser click", "browser type", "fill the form",
+                   "fill form", "fill out form", "fill in the form",
+                   "submit form", "apply to", "job application", "login to",
+                   "sign in to", "fill and submit", "fill out and submit",
+                   "autofill", "auto fill", "playwright", "webpage",
+                   "web page", "website automation"}):
+            set(),
         # Cookbook / model serving intent — user says "kill cookbook",
         # "stop the model", "what's running", etc.
         frozenset({"cookbook", "kill cookbook", "stop cookbook",
