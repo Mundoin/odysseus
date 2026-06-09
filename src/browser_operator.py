@@ -566,6 +566,286 @@ def format_page_inventory(inventory: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+_FIELD_VALUE_ALIASES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("first_name", ("first name", "firstname", "given name", "vorname")),
+    ("last_name", ("last name", "lastname", "surname", "nachname")),
+    ("email", ("email", "e-mail", "mail")),
+    ("phone", ("phone", "mobile", "telefon", "telephone", "tel")),
+    ("address", ("address", "street", "strasse", "straße")),
+    ("city", ("city", "ort", "stadt")),
+    ("postcode", ("postcode", "postal code", "zip", "plz")),
+    ("country", ("country", "land")),
+    ("linkedin", ("linkedin", "linked in")),
+    ("github", ("github", "git hub")),
+    ("website", ("website", "portfolio", "homepage")),
+    ("cover_letter", ("cover letter", "motivation", "anschreiben")),
+    ("salary_expectation", ("salary expectation", "gehaltsvorstellung")),
+    ("availability", ("availability", "start date", "frühester eintritt", "fruehester eintritt")),
+)
+_SENSITIVE_FIELD_KEYWORDS = (
+    "password", "passwd", "token", "auth code", "api key", "apikey", "secret",
+    "payment card", "card number", "credit card", "cvv", "cvc", "iban",
+    "bank", "national id", "passport", "personalausweis", "tax id", "tax",
+    "health", "medical", "private message",
+)
+
+
+def _field_ref(field: dict[str, Any], index: int) -> str:
+    return str(field.get("id") or field.get("name") or field.get("label") or f"field_{index + 1}")
+
+
+def _field_identity(field: dict[str, Any]) -> str:
+    return " ".join(
+        str(field.get(key) or "")
+        for key in ("label", "name", "id", "type", "candidate_meaning")
+    ).lower()
+
+
+def _known_value_key_for_field(field: dict[str, Any]) -> str | None:
+    identity = _field_identity(field)
+    compact = re.sub(r"[^a-z0-9äöüß]+", "", identity)
+    for key, aliases in _FIELD_VALUE_ALIASES:
+        for alias in aliases:
+            alias_text = alias.lower()
+            alias_compact = re.sub(r"[^a-z0-9äöüß]+", "", alias_text)
+            if alias_text in identity or alias_compact in compact:
+                return key
+    return None
+
+
+def _is_sensitive_form_field(field: dict[str, Any]) -> tuple[bool, str]:
+    identity = _field_identity(field)
+    if str(field.get("type") or "").lower() == "password":
+        return True, "password fields must be filled manually or with explicit user direction"
+    for keyword in _SENSITIVE_FIELD_KEYWORDS:
+        if keyword in identity:
+            return True, f"field matches sensitive keyword '{keyword}'"
+    return False, ""
+
+
+def _document_candidate_for_upload(
+    upload: dict[str, Any],
+    document_candidates: dict[str, Any],
+) -> Any:
+    identity = " ".join(
+        str(upload.get(key) or "")
+        for key in ("label", "name", "id", "accepted_types")
+    ).lower()
+    candidate_aliases = (
+        ("cv", ("cv", "resume", "lebenslauf")),
+        ("cover_letter", ("cover letter", "motivation", "anschreiben")),
+        ("certificate", ("certificate", "certification", "zeugnis", "diploma")),
+    )
+    for key, aliases in candidate_aliases:
+        if any(alias in identity for alias in aliases) and key in document_candidates:
+            return redact_sensitive_value(document_candidates[key], key)
+    return ""
+
+
+def _plan_confidence(fields_total: int, fields_mapped: int, missing: int, sensitive: int) -> str:
+    if fields_total == 0:
+        return "low"
+    ratio = fields_mapped / fields_total
+    if ratio >= 0.75 and missing == 0 and sensitive == 0:
+        return "high"
+    if ratio >= 0.4:
+        return "medium"
+    return "low"
+
+
+def _value_preview(value: Any, key: str) -> Any:
+    redacted = redact_sensitive_value(value, key)
+    if isinstance(redacted, str):
+        redacted = re.sub(r"(?i)\bprivate\s+message\b", "[REDACTED]", redacted)
+        return redact_sensitive_text(redacted)[:160]
+    return redacted
+
+
+def build_form_fill_plan(
+    page_inventory: dict[str, Any],
+    known_values: dict[str, Any] | None = None,
+    document_candidates: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Create a safe, redacted form-fill plan from a page inventory."""
+    known_values = known_values or {}
+    document_candidates = document_candidates or {}
+    fill_steps: list[dict[str, Any]] = []
+    missing_values: list[dict[str, Any]] = []
+    sensitive_values: list[dict[str, Any]] = []
+    upload_steps: list[dict[str, Any]] = []
+    blocked_actions: list[dict[str, Any]] = []
+    next_safe_actions: list[dict[str, Any]] = []
+
+    fields = page_inventory.get("fields") or []
+    upload_refs = {
+        (upload.get("id"), upload.get("name"), upload.get("label"))
+        for upload in page_inventory.get("upload_fields") or []
+    }
+    fields_total = 0
+
+    for index, field in enumerate(fields):
+        field_type = str(field.get("type") or "unknown")
+        is_upload = (
+            field_type.lower() == "file"
+            or field.get("candidate_meaning") == "file upload"
+            or (field.get("id"), field.get("name"), field.get("label")) in upload_refs
+        )
+        if is_upload:
+            continue
+        fields_total += 1
+        ref = _field_ref(field, index)
+        sensitive, reason = _is_sensitive_form_field(field)
+        if sensitive:
+            sensitive_values.append({
+                "field_ref": ref,
+                "label": field.get("label", ""),
+                "name": field.get("name", ""),
+                "id": field.get("id", ""),
+                "field_type": field_type,
+                "required": field.get("required", "unknown"),
+                "reason": reason,
+                "requires_user_confirmation": True,
+            })
+            continue
+
+        value_key = _known_value_key_for_field(field)
+        if value_key and value_key in known_values and known_values[value_key] not in (None, ""):
+            fill_steps.append({
+                "field_ref": ref,
+                "label": field.get("label", ""),
+                "name": field.get("name", ""),
+                "id": field.get("id", ""),
+                "field_type": field_type,
+                "value_preview_redacted": _value_preview(known_values[value_key], value_key),
+                "value_source": f"known_values.{value_key}",
+                "confidence": "high",
+                "safe_to_fill": True,
+                "reason": f"mapped field to known value '{value_key}'",
+            })
+        else:
+            label = field.get("label") or field.get("name") or ref
+            missing_values.append({
+                "field_ref": ref,
+                "label": field.get("label", ""),
+                "name": field.get("name", ""),
+                "id": field.get("id", ""),
+                "field_type": field_type,
+                "question_for_user": f"What value should I use for {label}?",
+                "reason": "no matching known value was available",
+            })
+
+    seen_upload_refs: set[str] = set()
+    for index, upload in enumerate(page_inventory.get("upload_fields") or []):
+        ref = _field_ref(upload, index)
+        if ref in seen_upload_refs:
+            continue
+        seen_upload_refs.add(ref)
+        upload_steps.append({
+            "field_ref": ref,
+            "label": upload.get("label", ""),
+            "name": upload.get("name", ""),
+            "id": upload.get("id", ""),
+            "accepted_types": upload.get("accepted_types", "unknown"),
+            "candidate_document": _document_candidate_for_upload(upload, document_candidates),
+            "requires_approval": True,
+            "reason": "file uploads can disclose local documents and require approval",
+        })
+
+    for action in page_inventory.get("risky_actions") or []:
+        blocked_actions.append({
+            "action": action.get("action", "action"),
+            "target": action.get("target", ""),
+            "reason": action.get("reason", "risky browser action requires approval"),
+            "requires_approval": True,
+        })
+    for action in page_inventory.get("safe_actions") or []:
+        next_safe_actions.append({
+            "action": action.get("action", "action"),
+            "target": action.get("target", ""),
+            "reason": action.get("reason", "safe browser action"),
+        })
+    for step in fill_steps:
+        next_safe_actions.append({
+            "action": "fill",
+            "target": step["field_ref"],
+            "reason": step["reason"],
+        })
+
+    return {
+        "page_url": page_inventory.get("url", ""),
+        "page_title": page_inventory.get("title", ""),
+        "confidence": _plan_confidence(fields_total, len(fill_steps), len(missing_values), len(sensitive_values)),
+        "fields_total": fields_total,
+        "fields_mapped": len(fill_steps),
+        "fields_missing": len(missing_values),
+        "fields_sensitive": len(sensitive_values),
+        "fill_steps": fill_steps,
+        "missing_values": missing_values,
+        "sensitive_values": sensitive_values,
+        "upload_steps": upload_steps,
+        "blocked_actions": blocked_actions,
+        "next_safe_actions": next_safe_actions,
+    }
+
+
+def _format_plan_list(label: str, items: list[dict[str, Any]], fields: tuple[str, ...]) -> list[str]:
+    lines = [label]
+    if not items:
+        lines.append("- None.")
+        return lines
+    for item in items[:12]:
+        details = []
+        for field in fields:
+            value = item.get(field)
+            if value not in (None, "", []):
+                details.append(f"{field}={value}")
+        lines.append(f"- {', '.join(details) if details else item}")
+    return lines
+
+
+def format_form_fill_plan(plan: dict[str, Any]) -> str:
+    lines = [
+        "Form fill plan",
+        f"- Page title: {plan.get('page_title') or 'unknown'}",
+        f"- Page URL: {plan.get('page_url') or 'unknown'}",
+        f"- Confidence: {plan.get('confidence') or 'unknown'}",
+        f"- Fields total/mapped/missing/sensitive: "
+        f"{plan.get('fields_total', 0)}/{plan.get('fields_mapped', 0)}/"
+        f"{plan.get('fields_missing', 0)}/{plan.get('fields_sensitive', 0)}",
+    ]
+    lines.extend(_format_plan_list(
+        "Mapped fill steps:",
+        plan.get("fill_steps") or [],
+        ("field_ref", "label", "name", "field_type", "value_preview_redacted", "value_source", "safe_to_fill", "reason"),
+    ))
+    lines.extend(_format_plan_list(
+        "Missing values/questions:",
+        plan.get("missing_values") or [],
+        ("field_ref", "label", "name", "field_type", "question_for_user", "reason"),
+    ))
+    lines.extend(_format_plan_list(
+        "Sensitive fields needing manual decision:",
+        plan.get("sensitive_values") or [],
+        ("field_ref", "label", "name", "field_type", "required", "reason", "requires_user_confirmation"),
+    ))
+    lines.extend(_format_plan_list(
+        "Upload steps requiring approval:",
+        plan.get("upload_steps") or [],
+        ("field_ref", "label", "name", "accepted_types", "candidate_document", "requires_approval", "reason"),
+    ))
+    lines.extend(_format_plan_list(
+        "Blocked submit/payment/send/apply actions:",
+        plan.get("blocked_actions") or [],
+        ("action", "target", "reason", "requires_approval"),
+    ))
+    lines.extend(_format_plan_list(
+        "Next safe actions:",
+        plan.get("next_safe_actions") or [],
+        ("action", "target", "reason"),
+    ))
+    return "\n".join(lines)
+
+
 def format_browser_observation(tool: str, result: dict[str, Any]) -> str | None:
     """Readable browser read/prepare result for the operator path."""
     if not is_browser_mcp_tool_name(tool):

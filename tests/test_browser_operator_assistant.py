@@ -410,3 +410,205 @@ def test_browser_operator_output_shows_page_inventory_sections():
     assert "Safe actions:" in text
     assert "Risky actions requiring approval:" in text
     assert "Unknowns/questions for the user:" in text
+
+
+def test_form_fill_plan_maps_common_fields_to_known_values():
+    from src.browser_operator import build_form_fill_plan, build_page_inventory
+
+    inventory = build_page_inventory(
+        {
+            "content": {
+                "title": "Application",
+                "url": "https://jobs.example.test/apply",
+                "fields": [
+                    {"label": "First name", "name": "firstName", "type": "text", "required": True},
+                    {"label": "Nachname", "name": "last_name", "type": "text", "required": True},
+                    {"label": "E-mail", "name": "email", "type": "email", "required": True},
+                    {"label": "Telefon", "name": "phone", "type": "tel"},
+                ],
+            }
+        }
+    )
+
+    plan = build_form_fill_plan(
+        inventory,
+        known_values={
+            "first_name": "Bujar",
+            "last_name": "Mundoin",
+            "email": "bujar@example.test",
+            "phone": "+49 30 123456",
+        },
+    )
+
+    assert plan["page_url"] == "https://jobs.example.test/apply"
+    assert plan["page_title"] == "Application"
+    assert plan["fields_total"] == 4
+    assert plan["fields_mapped"] == 4
+    assert plan["fields_missing"] == 0
+    assert all(step["safe_to_fill"] is True for step in plan["fill_steps"])
+    assert {step["value_source"] for step in plan["fill_steps"]} == {
+        "known_values.first_name",
+        "known_values.last_name",
+        "known_values.email",
+        "known_values.phone",
+    }
+
+
+def test_form_fill_plan_missing_fields_produce_questions():
+    from src.browser_operator import build_form_fill_plan, build_page_inventory
+
+    inventory = build_page_inventory(
+        {
+            "content": {
+                "fields": [
+                    {"label": "City", "name": "city", "type": "text", "required": True},
+                    {"label": "Availability", "name": "start_date", "type": "text"},
+                ],
+            }
+        }
+    )
+
+    plan = build_form_fill_plan(inventory, known_values={"city": "Berlin"})
+
+    assert plan["fields_mapped"] == 1
+    assert plan["fields_missing"] == 1
+    assert plan["missing_values"][0]["field_ref"]
+    assert "Availability" in plan["missing_values"][0]["question_for_user"]
+
+
+def test_form_fill_plan_excludes_sensitive_fields_from_fill_steps():
+    from src.browser_operator import build_form_fill_plan, build_page_inventory
+
+    inventory = build_page_inventory(
+        {
+            "content": {
+                "fields": [
+                    {"label": "Password", "name": "password", "type": "password", "required": True},
+                    {"label": "Payment card", "name": "card_number", "type": "text", "required": True},
+                    {"label": "Tax ID", "name": "tax_id", "type": "text"},
+                ],
+            }
+        }
+    )
+
+    plan = build_form_fill_plan(
+        inventory,
+        known_values={"password": "hunter2", "card_number": "4111111111111111", "tax_id": "123"},
+    )
+
+    assert plan["fields_sensitive"] == 3
+    assert plan["fill_steps"] == []
+    assert len(plan["sensitive_values"]) == 3
+    assert all(item["requires_user_confirmation"] is True for item in plan["sensitive_values"])
+
+
+def test_form_fill_plan_upload_fields_require_approval_with_candidate_document():
+    from src.browser_operator import build_form_fill_plan, build_page_inventory
+
+    inventory = build_page_inventory(
+        {
+            "content": {
+                "fields": [
+                    {"label": "CV upload", "name": "resume", "type": "file", "accept": ".pdf"},
+                    {"label": "Certificate", "name": "certificate", "type": "file"},
+                ]
+            }
+        }
+    )
+
+    plan = build_form_fill_plan(
+        inventory,
+        document_candidates={
+            "cv": "D:\\Docs\\Bujar_CV.pdf",
+            "certificate": "D:\\Docs\\CCNA.pdf",
+        },
+    )
+
+    assert len(plan["upload_steps"]) == 2
+    assert all(step["requires_approval"] is True for step in plan["upload_steps"])
+    assert plan["upload_steps"][0]["candidate_document"] == "D:\\Docs\\Bujar_CV.pdf"
+    assert plan["upload_steps"][1]["candidate_document"] == "D:\\Docs\\CCNA.pdf"
+
+
+def test_form_fill_plan_blocks_submit_apply_and_payment_buttons():
+    from src.browser_operator import build_form_fill_plan, build_page_inventory
+
+    inventory = build_page_inventory(
+        {
+            "content": {
+                "buttons": [
+                    {"text": "Search", "type": "button"},
+                    {"text": "Apply now", "type": "submit"},
+                    {"text": "Submit payment", "type": "submit"},
+                ],
+            }
+        }
+    )
+
+    plan = build_form_fill_plan(inventory)
+
+    assert any(action["target"] == "Search" for action in plan["next_safe_actions"])
+    assert {action["target"] for action in plan["blocked_actions"]} == {"Apply now", "Submit payment"}
+    assert all(action["requires_approval"] is True for action in plan["blocked_actions"])
+
+
+def test_form_fill_plan_redacts_value_previews():
+    from src.browser_operator import build_form_fill_plan, build_page_inventory
+
+    inventory = build_page_inventory(
+        {
+            "content": {
+                "fields": [
+                    {"label": "Cover letter", "name": "cover_letter", "type": "textarea"},
+                    {"label": "Email", "name": "email", "type": "email"},
+                ],
+            }
+        }
+    )
+
+    plan = build_form_fill_plan(
+        inventory,
+        known_values={
+            "cover_letter": "Please use token=abc123 in my private message.",
+            "email": "bujar@example.test",
+        },
+    )
+
+    rendered = str(plan)
+    assert "abc123" not in rendered
+    assert "private message" not in rendered.lower()
+    assert "[REDACTED]" in rendered
+
+
+def test_format_form_fill_plan_includes_all_operator_sections():
+    from src.browser_operator import build_form_fill_plan, build_page_inventory, format_form_fill_plan
+
+    inventory = build_page_inventory(
+        {
+            "content": {
+                "title": "Apply",
+                "fields": [
+                    {"label": "Email", "name": "email", "type": "email"},
+                    {"label": "City", "name": "city", "type": "text"},
+                    {"label": "Password", "name": "password", "type": "password"},
+                    {"label": "CV upload", "name": "cv", "type": "file"},
+                ],
+                "buttons": [{"text": "Apply now", "type": "submit"}],
+            }
+        }
+    )
+    plan = build_form_fill_plan(
+        inventory,
+        known_values={"email": "bujar@example.test"},
+        document_candidates={"cv": "D:\\Docs\\Bujar_CV.pdf"},
+    )
+
+    text = format_form_fill_plan(plan)
+
+    assert "Form fill plan" in text
+    assert "Mapped fill steps:" in text
+    assert "Missing values/questions:" in text
+    assert "Sensitive fields needing manual decision:" in text
+    assert "Upload steps requiring approval:" in text
+    assert "Blocked submit/payment/send/apply actions:" in text
+    assert "Next safe actions:" in text
