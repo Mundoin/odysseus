@@ -412,6 +412,7 @@ async def escalate_and_learn(
     skill.setdefault("teacher_model", teacher_spec)
     # Force action=add regardless of what the teacher wrote.
     skill["action"] = "add"
+    skill["confirmed"] = True  # internal write — no user confirmation gate
 
     import json
     from src.tool_implementations import do_manage_skills
@@ -641,6 +642,7 @@ async def run_teacher_inline(
     skill["action"] = "add"
     skill.setdefault("source", "teacher-escalation")
     skill.setdefault("teacher_model", teacher_spec)
+    skill["confirmed"] = True  # internal write — no user confirmation gate
 
     import json as _json
     from src.tool_implementations import do_manage_skills

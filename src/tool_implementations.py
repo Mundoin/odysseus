@@ -653,6 +653,31 @@ async def do_manage_skills(content: str, owner: Optional[str] = None) -> Dict:
             return {"error": f"Reference {ref!r} not found under {name!r}", "exit_code": 1}
         return {"results": text}
 
+    _mutating = action in ("add", "edit", "patch", "publish", "delete")
+    if _mutating and not args.get("confirmed"):
+        _preview: Dict = {
+            "pending_confirmation": True,
+            "action": action,
+            "name": name or "(not set)",
+        }
+        if action == "add":
+            _preview["description"] = (args.get("description") or args.get("title") or "")[:200]
+            _preview["category"] = args.get("category") or "general"
+        elif action in ("edit", "patch"):
+            _preview["change_summary"] = (
+                f"Replace old_string ({len(args.get('old_string',''))} chars)" if action == "patch"
+                else f"Full SKILL.md replace ({len(args.get('content',''))} chars)"
+            )
+        elif action == "publish":
+            _preview["status_change"] = "draft → published"
+        elif action == "delete":
+            _preview["warning"] = "Skill directory will be permanently removed."
+        _preview["instruction"] = (
+            "Show this preview to the user and ask for explicit approval. "
+            "Re-call with confirmed=true to execute."
+        )
+        return _preview
+
     if action == "add":
         if not name:
             return {
