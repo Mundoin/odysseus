@@ -25,6 +25,7 @@ from src.tool_policy import ToolPolicy
 from src.constants import MAX_OUTPUT_CHARS, MAX_READ_CHARS, MAX_DIFF_LINES, DATA_DIR
 from src.tool_utils import _truncate, get_mcp_manager
 from src.external_action_guard import guard_mcp as _ext_guard_mcp
+from src.browser_operator import format_browser_observation, format_confirmation_preview
 
 # Persistent working directory for agent subprocesses.
 # Resolves to <repo_root>/data, which is the bind-mounted volume in Docker
@@ -804,6 +805,12 @@ _FORMATTER_HANDLED_KEYS = {
     "response", "results", "session_id", "name", "model", "session_name",
     "success", "path", "action", "title", "doc_id", "version", "applied",
     "error", "output",
+    "pending_confirmation", "confirmation_required", "tool", "tool_name",
+    "action_name", "action_type", "action_category", "risk_level", "method",
+    "target", "target_domain", "target_url", "target_resource", "summary",
+    "consequences", "risk", "instruction", "approval_instruction",
+    "body_preview", "arguments_preview", "high_impact", "high_impact_reason",
+    "final_checklist", "final_review_checklist", "integration", "url",
 }
 
 
@@ -811,7 +818,11 @@ def format_tool_result(description: str, result: Dict) -> str:
     """Format a tool result into text for feeding back to the LLM."""
     parts = [f"### {description}"]
 
-    if "stdout" in result:
+    if result.get("pending_confirmation"):
+        parts.append(format_confirmation_preview(result))
+    elif (browser_observation := format_browser_observation(description, result)):
+        parts.append(browser_observation)
+    elif "stdout" in result:
         if result["stdout"]:
             parts.append(f"**stdout:**\n```\n{result['stdout']}\n```")
         if result["stderr"]:

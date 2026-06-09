@@ -22,6 +22,7 @@ from src.prompt_security import untrusted_context_message
 from src.tool_security import blocked_tools_for_owner, plan_mode_disabled_tools
 from src.tool_policy import GUIDE_ONLY_DIRECTIVE, ToolPolicy
 from src.tool_utils import get_mcp_manager
+from src.browser_operator import format_browser_observation, format_confirmation_preview
 from src.agent_tools import (
     parse_tool_blocks,
     strip_tool_blocks,
@@ -2739,7 +2740,10 @@ async def stream_agent_loop(
             # Build output for frontend tool bubble.
             # Document tools get a short summary — content goes to the editor panel.
             output_text = ""
-            if is_doc_tool and "action" in result:
+            browser_observation = format_browser_observation(block.tool_type, result)
+            if browser_observation:
+                output_text = browser_observation[:4000]
+            elif is_doc_tool and "action" in result:
                 action = result["action"]
                 title = result.get("title", "")
                 ver = result.get("version", "?")
@@ -2765,6 +2769,8 @@ async def stream_agent_loop(
                 output_text = result["content"][:2000]
             elif "results" in result:
                 output_text = result["results"][:4000]
+            elif result.get("pending_confirmation"):
+                output_text = format_confirmation_preview(result)[:4000]
             elif "session_id" in result and "name" in result:
                 output_text = f"Session created: {result['name']} (id: {result['session_id']})"
             elif "success" in result:
@@ -2794,6 +2800,8 @@ async def stream_agent_loop(
             # Forward a file-write diff for inline before/after rendering
             if "diff" in result:
                 tool_output_data["diff"] = result["diff"]
+            if result.get("pending_confirmation"):
+                tool_output_data["confirmation_preview"] = result
             yield f'data: {json.dumps(tool_output_data)}\n\n'
 
             # Native document tools open in the editor + carry the REAL doc id.
@@ -2853,6 +2861,8 @@ async def stream_agent_loop(
             # this the diff shows live but vanishes from saved history.
             if result.get("diff"):
                 tool_event["diff"] = result["diff"]
+            if result.get("pending_confirmation"):
+                tool_event["confirmation_preview"] = result
             tool_events.append(tool_event)
             if block.tool_type in _VERIFIER_EFFECTFUL_TOOLS:
                 _effectful_used = True

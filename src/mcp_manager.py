@@ -633,6 +633,7 @@ class McpManager:
         tools = self.get_all_tools(disabled_map)
         if not tools:
             return ""
+        from src.browser_operator import BROWSER_OPERATOR_RULES, is_browser_mcp_tool_name
 
         lines = ["\n\nYou also have access to external MCP tool servers. These tools are called via native function calling:"]
         by_server = {}
@@ -665,6 +666,9 @@ class McpManager:
                 # alone (issue #2509).
                 args_hint = _format_mcp_params(t.get("input_schema"))
                 lines.append(f"  - {t['qualified_name']}: {desc}{args_hint}")
+
+        if any(is_browser_mcp_tool_name(t.get("name")) for t in tools if not t.get("is_disabled")):
+            lines.append(BROWSER_OPERATOR_RULES)
 
         result = "\n".join(lines)
         self._cached_prompt_desc = result
