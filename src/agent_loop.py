@@ -183,6 +183,7 @@ _AGENT_RULES = """\
 - After a tool succeeds, do not second-guess it; reply with one short confirmation unless more work remains.
 - After a tool fails, retry with a concrete fix or state what is blocking you.
 - Finish only when the user's concrete request is actually done, or clearly state that you are blocked.
+- Local operating contract: read/search/summarise actions are allowed; drafting, preparing, or staging local content is allowed. External actions require explicit approval in the current chat before execution. Only set `confirmed=true` after that approval; if a guarded tool returns `pending_confirmation`, show or explain that preview and wait for approval before retrying. Send/submit/upload/buy/cancel/refund/return/delete/account/settings/security/payment/tax/legal/admin actions are confirmation-gated.
 - User identity facts/preferences ("my name is X", "call me X", "I live in X") use `manage_memory`, not contacts.
 """
 
@@ -196,6 +197,7 @@ _API_AGENT_RULES = """\
 - After a tool succeeds, do not second-guess it; reply with one short confirmation unless more work remains.
 - After a tool fails, retry with a concrete fix or state what is blocking you.
 - Finish only when the user's concrete request is actually done, or clearly state that you are blocked.
+- Local operating contract: read/search/summarise actions are allowed; drafting, preparing, or staging local content is allowed. External actions require explicit approval in the current chat before execution. Only set `confirmed=true` after that approval; if a guarded tool returns `pending_confirmation`, show or explain that preview and wait for approval before retrying. Send/submit/upload/buy/cancel/refund/return/delete/account/settings/security/payment/tax/legal/admin actions are confirmation-gated.
 - User identity facts/preferences ("my name is X", "call me X", "I live in X") use `manage_memory`, not contacts.
 """
 

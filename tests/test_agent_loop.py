@@ -39,6 +39,8 @@ try:
         _compute_final_metrics,
         _append_tool_results,
         _MCP_KEYWORDS,
+        _AGENT_RULES,
+        _API_AGENT_RULES,
     )
     _IMPORTED_AGENT_LOOP = sys.modules.get("src.agent_loop")
 finally:
@@ -60,6 +62,16 @@ def test_import_stubs_do_not_leak_into_later_tests():
 
 def test_mcp_keyword_gate_matches_literal_mcp_requests():
     assert "mcp" in _MCP_KEYWORDS
+
+
+def test_agent_rules_include_external_action_confirmation_contract():
+    for rules in (_AGENT_RULES, _API_AGENT_RULES):
+        assert "read/search/summarise actions are allowed" in rules
+        assert "drafting, preparing, or staging local content is allowed" in rules
+        assert "explicit approval in the current chat" in rules
+        assert "Only set `confirmed=true` after that approval" in rules
+        assert "`pending_confirmation`" in rules
+        assert "send/submit/upload/buy/cancel/refund/return/delete/account/settings/security/payment/tax/legal/admin actions are confirmation-gated" in rules.lower()
 
 
 # ---------------------------------------------------------------------------
