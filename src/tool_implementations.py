@@ -1811,10 +1811,23 @@ async def do_api_call(content: str) -> Dict:
         available = ", ".join(i["name"] for i in integrations if i.get("enabled", True))
         return {"error": f"No integration matching '{integration_name}'. Available: {available or 'none configured'}", "exit_code": 1}
 
+    _method = (args.get("method") or "GET").upper()
+    _path = args.get("path") or "/"
+    _block = __import__("src.external_action_guard", fromlist=["guard"]).guard(
+        tool="api_call",
+        method=_method,
+        target=f"{intg['name']}:{_path}",
+        confirmed=bool(args.get("confirmed", False)),
+        body=args.get("body"),
+        integration=intg.get("name"),
+    )
+    if _block is not None:
+        return _block
+
     return await execute_api_call(
         intg["id"],
-        args.get("method", "GET"),
-        args.get("path", "/"),
+        _method,
+        _path,
         params=args.get("params"),
         body=args.get("body"),
         extra_headers=args.get("headers"),
@@ -2955,6 +2968,16 @@ async def do_app_api(content: str, owner: Optional[str] = None) -> Dict:
         if "/api/calendar/events" in path:
             return {"error": "Don't hit /api/calendar/events via app_api — use the `manage_calendar` tool. It handles tz-aware natural-language datetimes and reminder_minutes correctly. If the user wants a note + reminder, prefer `manage_notes` with due_date — it bundles both.", "exit_code": 1}
         return {"error": f"{method} {path} is blocked — it overwrites the whole cookbook state file. Use list_serve_presets / serve_preset / serve_model instead.", "exit_code": 1}
+
+    _block = __import__("src.external_action_guard", fromlist=["guard"]).guard(
+        tool="app_api",
+        method=method,
+        target=path,
+        confirmed=bool(args.get("confirmed", False)),
+        body=args.get("body"),
+    )
+    if _block is not None:
+        return _block
 
     body = args.get("body")
     query = args.get("query") or None
