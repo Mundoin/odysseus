@@ -188,7 +188,7 @@ _AGENT_RULES = """\
 - After a tool succeeds, do not second-guess it; reply with one short confirmation unless more work remains.
 - After a tool fails, retry with a concrete fix or state what is blocking you.
 - Finish only when the user's concrete request is actually done, or clearly state that you are blocked.
-- Local operating contract: read/search/summarise actions are allowed; drafting, preparing, or staging local content is allowed. External actions require explicit approval in the current chat before execution. Only set `confirmed=true` after that approval; if a guarded tool returns `pending_confirmation`, show or explain that preview and wait for approval before retrying. Send/submit/upload/buy/cancel/refund/return/delete/account/settings/security/payment/tax/legal/admin actions are confirmation-gated.
+- Local operating contract: read/search/summarise actions are allowed; drafting, preparing, or staging local content is allowed. External actions require explicit approval in the current chat before execution. Only set `confirmed=true` after that approval; if a guarded tool returns `pending_confirmation`, show or explain that preview and wait for approval before retrying. Send/submit/upload/buy/cancel/refund/return/delete/account/settings/security/payment/tax/legal/admin actions are confirmation-gated. **For browser form fills, the single approval-gated tool is `browser_operator_safe_fill` — call it without `confirmed` first for preview, then with `confirmed=true` after approval.**
 - User identity facts/preferences ("my name is X", "call me X", "I live in X") use `manage_memory`, not contacts.
 """
 
@@ -202,7 +202,7 @@ _API_AGENT_RULES = """\
 - After a tool succeeds, do not second-guess it; reply with one short confirmation unless more work remains.
 - After a tool fails, retry with a concrete fix or state what is blocking you.
 - Finish only when the user's concrete request is actually done, or clearly state that you are blocked.
-- Local operating contract: read/search/summarise actions are allowed; drafting, preparing, or staging local content is allowed. External actions require explicit approval in the current chat before execution. Only set `confirmed=true` after that approval; if a guarded tool returns `pending_confirmation`, show or explain that preview and wait for approval before retrying. Send/submit/upload/buy/cancel/refund/return/delete/account/settings/security/payment/tax/legal/admin actions are confirmation-gated.
+- Local operating contract: read/search/summarise actions are allowed; drafting, preparing, or staging local content is allowed. External actions require explicit approval in the current chat before execution. Only set `confirmed=true` after that approval; if a guarded tool returns `pending_confirmation`, show or explain that preview and wait for approval before retrying. Send/submit/upload/buy/cancel/refund/return/delete/account/settings/security/payment/tax/legal/admin actions are confirmation-gated. **For browser form fills, the single approval-gated tool is `browser_operator_safe_fill` — call it without `confirmed` first for preview, then with `confirmed=true` after approval.**
 - User identity facts/preferences ("my name is X", "call me X", "I live in X") use `manage_memory`, not contacts.
 """
 
@@ -274,10 +274,11 @@ _DOMAIN_RULES = {
 - Browser automation tools are MCP-provided; their names start with `browser_` or `mcp__`.
 - Before any browser action, inspect the current page with a snapshot/screenshot tool first.
 - Read-only tools (snapshot, screenshot, console/network inspection) are always allowed.
-- Filling safe text-like fields is allowed as local prepare. Stop before any submit/upload/apply/payment/send action.
-- If a browser tool returns `pending_confirmation`, show the preview to the user and wait for explicit chat approval. Only then retry with `confirmed=true`.
+- Filling safe text-like fields is allowed as local prepare. Stop before any submit/upload/apply/payment/send action. Submit, upload, apply, and payment actions remain blocked.
+- **`browser_operator_safe_fill` is the mandated tool for safe form filling.** Use it for any form-fill intent. Do not claim success unless `browser_operator_safe_fill` (or its verified backend) returns a confirmed-fill result. Do not switch to `browser_type`, `browser_fill`, or `browser_select_option` directly unless `browser_operator_safe_fill` reports unavailable AND the fallback is explicitly allowed.
+- If a browser tool returns `pending_confirmation`, show the preview to the user and wait for explicit chat approval. Only then retry with `browser_operator_safe_fill` and `confirmed=true`. Do not re-request approval for the same safe fill batch after user approval — just call `browser_operator_safe_fill` with `confirmed=true`. After user approval, the next assistant step must call `browser_operator_safe_fill` with `confirmed=true`.
 - If the browser runtime is not connected, say "Browser automation runtime is not connected" and list the missing setup (npx @playwright/mcp must be cached). Do not pretend browser tools exist.
-- Safe fill workflow: after the user explicitly approves a fill plan, execute fills using the available fill/type/select tools (`browser_fill`, `browser_type`, `browser_select_option`). Do NOT ask for approval again for the same approved fill batch — proceed to execute.
+- Safe fill workflow: after the user explicitly approves a fill plan, execute fills using `browser_operator_safe_fill`. Do NOT ask for approval again for the same approved fill batch — proceed to execute.
 - Batch safe fills in groups of 2-3 fields, then verify with a snapshot after each batch. Report which fields succeeded, failed, or could not be verified.
 - If no fill/type/select tools are available, say which specific tool names are missing, not "browser tools are unavailable".""",
 }
@@ -721,6 +722,8 @@ _EXPLICIT_CONTINUATION_RE = re.compile(
     r"yes|y|yeah|yep|ok|okay|sure|do it|go ahead|continue|carry on|"
     r"run it|launch it|start it|use that|that one|same|the same|"
     r"first|second|third|the first one|the second one|the third one|"
+    r"approved|execute|proceed|fill them|fill it|I approve|do it now|"
+    r"go for it|apply them|go|run|"
     r"[123]|[abc]"
     r")\s*[.!?]*\s*$",
     re.IGNORECASE,
@@ -2216,7 +2219,8 @@ async def stream_agent_loop(
         r"(?:tail|check|investigate|look at|see|tail|read|fetch|inspect|"
         r"verify|diagnose|examine|debug|capture|grab|pull|view|run|call|"
         r"trigger|launch|start|kick off|stop|kill|restart|adopt|serve|"
-        r"register|adopt|list|search|find|query|hit|ping|test)"
+        r"register|adopt|list|search|find|query|hit|ping|test|"
+        r"submit|execute|send|dispatch|fill|apply)"
         r"\b[^.\n]{0,140}",
         re.IGNORECASE,
     )
@@ -2301,6 +2305,20 @@ async def stream_agent_loop(
 
         _tool_names_sent = [t.get("function", {}).get("name") for t in (all_tool_schemas or []) if t.get("function")]
         logger.info(f"[agent-debug] round={round_num} model={model} _is_api_model={_is_api_model} tools_sent={len(_tool_names_sent)} tool_names={_tool_names_sent[:15]} relevant_tools={sorted(_relevant_tools)[:15] if _relevant_tools else 'ALL'}")
+        # Diagnostic: warn when browser_operator_safe_fill is available but
+        # the user message resembles a form-fill continuation that won't
+        # trigger the tool (e.g. approval text that the model just narrates).
+        if _relevant_tools and "browser_operator_safe_fill" in _relevant_tools:
+            _last_user_lower = (_last_user or "").lower()
+            if "browser_operator_safe_fill" not in _last_user_lower and any(
+                kw in _last_user_lower for kw in ("fill", "form", "approved", "confirm")
+            ):
+                logger.warning(
+                    "[agent] diagnostic: browser_operator_safe_fill is in relevant_tools "
+                    "but user message (%r) may not trigger its use — check whether "
+                    "the model adopted the mandated tool",
+                    _last_user[:120] if _last_user else "",
+                )
 
         # Primary target + any configured fallback models. stream_llm_with_fallback
         # only switches on a pre-content failure, so streamed output is never
@@ -2642,6 +2660,32 @@ async def stream_agent_loop(
                     ),
                 })
                 # Visible signal in the stream so the user knows we caught it.
+                yield f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
+                continue
+
+            # Specific check: model mentioned browser_operator_safe_fill in prose
+            # but didn't actually call it (the tool_block would contain it).
+            _safe_fill_mentioned = (
+                "browser_operator_safe_fill" in _intent_text.lower()
+                and _intent_nudge_count < _MAX_INTENT_NUDGES
+            )
+            if _safe_fill_mentioned:
+                _intent_nudge_count += 1
+                logger.warning(
+                    "[agent] tool_intent_without_call: browser_operator_safe_fill "
+                    "mentioned in round %d prose but no tool call found",
+                    round_num,
+                )
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "You just mentioned \"browser_operator_safe_fill\" but "
+                        "ended the turn without calling it. Emit the actual "
+                        "function call now instead of describing what you "
+                        "will do. If you need user approval first, call it "
+                        "without `confirmed=true` to generate a preview."
+                    ),
+                })
                 yield f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
                 continue
             break  # no tools — done

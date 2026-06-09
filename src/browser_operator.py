@@ -19,7 +19,8 @@ BROWSER_OPERATOR_RULES = """\
 - Summarize what you see for the user: page title/URL if available, visible purpose, important fields/buttons/links, safe next actions, and risky actions that need approval.
 - Drafting/preparing fields is allowed when the tool is a local prepare action. Do not submit, send, upload, buy, cancel, refund, return, delete, change account/settings/security/payment/tax/legal/admin state, or run page code without current-chat approval.
 - When filling forms, fill only safe non-sensitive text-like fields, work in small batches, verify with a fresh observation after each batch, stop before upload/submit/apply/payment/send, and report what changed or could not be verified.
-- If a browser action returns `pending_confirmation`, show the preview to the user and wait. Only after explicit current-chat approval should you retry the same MCP tool with `confirmed=true` and the same action arguments.
+- **`browser_operator_safe_fill` is the single tool for safe form filling.** Do not narrate about calling it — actually emit the function call. Do not use `browser_fill`, `browser_type`, or `browser_select_option` directly for form-fill tasks unless `browser_operator_safe_fill` itself reports it is unavailable.
+- If a browser action returns `pending_confirmation`, show the preview to the user and wait. Only after explicit current-chat approval should you retry with `browser_operator_safe_fill` and `confirmed=true`. After `pending_confirmation`, the only correct follow-up is `browser_operator_safe_fill` with `confirmed=true`.
 - After a confirmed browser action, report what happened from the tool result; do not claim success if the browser/MCP tool failed or was unavailable."""
 
 BROWSER_OPERATOR_UNAVAILABLE = """\

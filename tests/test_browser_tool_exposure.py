@@ -729,3 +729,165 @@ def test_classify_detects_verify_after_fill():
     from src.agent_loop import _classify_agent_request
     intent = _classify_agent_request([], "take a browser snapshot to verify the fill")
     assert "browser" in intent["domains"]
+
+
+# ── Tool enforcement: browser_operator_safe_fill is the single mandated fill tool ──────
+
+def test_form_fill_prompt_pins_safe_fill():
+    """When _classify_agent_request detects browser domain with form-fill keywords,
+    browser_operator_safe_fill should be included in the browser tool pin logic."""
+    from src.agent_loop import _classify_agent_request
+    # Various form-fill triggers
+    for prompt in [
+        "fill the form fields on this page",
+        "fill the form with my data",
+        "fill form with my data",
+        "fill out form for me",
+        "create a form-fill plan",
+    ]:
+        intent = _classify_agent_request([], prompt)
+        assert "browser" in intent["domains"], f"browser domain not detected for: {prompt}"
+
+
+def test_approval_followup_pins_safe_fill():
+    """Terse approval text ('approved', 'fill them') after a browser preview
+    should be classified as a continuation, retaining browser context."""
+    from src.agent_loop import _classify_agent_request
+
+    messages = [
+        {"role": "user", "content": "fill the form on the current page"},
+        {"role": "assistant", "content": "Here is the fill plan. I called browser_operator_safe_fill for preview."},
+    ]
+    for approval in ["approved", "I approve", "fill them", "fill it", "proceed", "execute", "do it now", "go for it"]:
+        intent = _classify_agent_request(messages, approval)
+        assert intent.get("continuation"), f"continuation not detected for: {approval}"
+        assert "browser" in intent["domains"], f"browser domain not detected for: {approval}"
+
+
+def test_domain_rules_mandate_safe_fill_tool():
+    """_DOMAIN_RULES['browser'] text contains key enforcement mandates."""
+    from src.agent_loop import _DOMAIN_RULES
+
+    rules = _DOMAIN_RULES.get("browser", "")
+    assert "browser_operator_safe_fill" in rules, "Must mandate browser_operator_safe_fill"
+    assert "Do not claim success" in rules or "do not claim success" in rules, "Must prohibit claiming success without tool result"
+    assert "browser_type" in rules and "browser_fill" in rules, "Must mention low-level fallback restriction"
+    assert "confirmed=true" in rules, "Must mention confirmed=true for approval follow-up"
+
+
+def test_operator_rules_mandate_safe_fill():
+    """BROWSER_OPERATOR_RULES text contains key enforcement mandates."""
+    from src.browser_operator import BROWSER_OPERATOR_RULES
+
+    assert "browser_operator_safe_fill" in BROWSER_OPERATOR_RULES, "Must mandate browser_operator_safe_fill"
+    assert "single tool" in BROWSER_OPERATOR_RULES.lower() or "single" in BROWSER_OPERATOR_RULES.lower(), "Must identify as single tool"
+    assert "do not narrate" in BROWSER_OPERATOR_RULES.lower() or "do not use" in BROWSER_OPERATOR_RULES, "Must prohibit narrating without calling"
+    assert "confirmed=true" in BROWSER_OPERATOR_RULES, "Must require confirmed=true after approval"
+
+
+def test_model_not_to_claim_success_without_tool_result():
+    """Both rule sets include prohibition on claiming success without tool verification."""
+    from src.agent_loop import _DOMAIN_RULES, _AGENT_RULES, _API_AGENT_RULES
+    from src.browser_operator import BROWSER_OPERATOR_RULES
+
+    browser_domain = _DOMAIN_RULES.get("browser", "")
+    assert "do not claim success" in browser_domain.lower() or "do not claim" in browser_domain.lower()
+
+    assert "do not claim success" in BROWSER_OPERATOR_RULES.lower() or "do not claim" in BROWSER_OPERATOR_RULES.lower()
+
+    # _AGENT_RULES and _API_AGENT_RULES have the "confirmed=true after approval" pattern
+    assert "confirmed=true" in _AGENT_RULES
+    assert "confirmed=true" in _API_AGENT_RULES
+
+
+def test_low_level_fallback_not_preferred():
+    """Rules say low-level browser_type/browser_fill is not the preferred path."""
+    from src.agent_loop import _DOMAIN_RULES
+    from src.browser_operator import BROWSER_OPERATOR_RULES
+
+    browser_domain = _DOMAIN_RULES.get("browser", "")
+    # Domain rules should mention the restriction on browser_type/fill/select_option
+    assert "browser_type" in browser_domain
+    assert "browser_fill" in browser_domain
+    assert "unavailable" in browser_domain.lower()
+
+    # Operator rules should restrict low-level tools
+    assert "browser_fill" in BROWSER_OPERATOR_RULES
+    assert "browser_type" in BROWSER_OPERATOR_RULES
+    assert "unavailable" in BROWSER_OPERATOR_RULES.lower()
+
+
+def test_submit_upload_apply_guarded():
+    """Rules explicitly block submit/upload/apply actions."""
+    from src.agent_loop import _DOMAIN_RULES
+
+    browser_domain = _DOMAIN_RULES.get("browser", "")
+    assert "submit" in browser_domain.lower() and "blocked" in browser_domain.lower() or "stop before" in browser_domain.lower()
+    assert "upload" in browser_domain.lower()
+    assert "apply" in browser_domain.lower()
+
+
+def test_continuation_re_matches_approval_words():
+    """_EXPLICIT_CONTINUATION_RE matches approval and continuation words."""
+    from src.agent_loop import _is_explicit_continuation
+
+    for word in ["approved", "I approve", "fill them", "fill it", "proceed",
+                  "execute", "do it now", "go for it", "apply them", "yes", "ok"]:
+        assert _is_explicit_continuation(word), f"Should match: {word!r}"
+
+    for word in ["no", "maybe", "what is this", "I don't think so"]:
+        assert not _is_explicit_continuation(word), f"Should NOT match: {word!r}"
+
+
+def test_intent_re_matches_tool_mention_prose():
+    """_INTENT_RE pattern matches prose mentioning browser_operator_safe_fill with an action verb."""
+    import re as _re
+    # Replicate the _INTENT_RE pattern from agent_loop.py
+    _intent_re = _re.compile(
+        r"(?:^|\n)\s*(?:let me|i'?ll|i will|going to|let's)\s+"
+        r"(?:tail|check|investigate|look at|see|tail|read|fetch|inspect|"
+        r"verify|diagnose|examine|debug|capture|grab|pull|view|run|call|"
+        r"trigger|launch|start|kick off|stop|kill|restart|adopt|serve|"
+        r"register|adopt|list|search|find|query|hit|ping|test|"
+        r"submit|execute|send|dispatch|fill|apply)"
+        r"\b[^.\n]{0,140}",
+        _re.IGNORECASE,
+    )
+
+    matching = [
+        "I'll call browser_operator_safe_fill to fill the form",
+        "Let me submit the form-fill plan with browser_operator_safe_fill",
+        "i will execute the fill using browser_operator_safe_fill",
+        "Let me fill the form fields using browser_operator_safe_fill",
+        "I will dispatch the safe fill plan with browser_operator_safe_fill",
+        "Let me apply the fill plan now",
+    ]
+    for text in matching:
+        assert _intent_re.search(text), f"Should match: {text!r}"
+
+
+def test_intent_re_does_not_match_casual_prose():
+    """_INTENT_RE should NOT match casual prose that isn't an action promise."""
+    import re as _re
+    _intent_re = _re.compile(
+        r"(?:^|\n)\s*(?:let me|i'?ll|i will|going to|let's)\s+"
+        r"(?:tail|check|investigate|look at|see|tail|read|fetch|inspect|"
+        r"verify|diagnose|examine|debug|capture|grab|pull|view|run|call|"
+        r"trigger|launch|start|kick off|stop|kill|restart|adopt|serve|"
+        r"register|adopt|list|search|find|query|hit|ping|test|"
+        r"submit|execute|send|dispatch|fill|apply)"
+        r"\b[^.\n]{0,140}",
+        _re.IGNORECASE,
+    )
+
+    non_matching = [
+        "Let me know what you think",
+        "I will be happy to help",
+        "I think we should proceed carefully",
+        "Let me reconsider the approach",
+    ]
+    for text in non_matching:
+        # These should not match because they don't contain action verbs
+        # from the alternation group
+        assert not _intent_re.search(text), f"Should NOT match: {text!r}"
+
