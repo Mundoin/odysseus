@@ -1367,10 +1367,21 @@ _SNAPSHOT_FIELD_RE = re.compile(
 )
 
 
+def _mcp_result_text(result: Any) -> str:
+    """Extract text from an MCP manager result. The manager returns
+    {"stdout": ..., "stderr": ..., "exit_code": ...}; fall back to the
+    structured content/payload helpers for other shapes."""
+    if isinstance(result, dict):
+        for key in ("stdout", "stderr"):
+            if isinstance(result.get(key), str) and result[key]:
+                return result[key]
+    return _text_from_payload(_content_payload(result))
+
+
 def parse_snapshot_fill_targets(snapshot_result: Any) -> list[dict[str, Any]]:
     """Extract fillable accessibility nodes (role, label, ref) from a
     Playwright MCP snapshot result."""
-    text = _text_from_payload(_content_payload(snapshot_result))
+    text = _mcp_result_text(snapshot_result)
     targets: list[dict[str, Any]] = []
     seen: set[str] = set()
     for match in _SNAPSHOT_FIELD_RE.finditer(text):
@@ -1389,6 +1400,9 @@ def _tool_call_failed(result: Any) -> str | None:
         return str(result["error"])
     if result.get("isError"):
         return str(result.get("content") or "tool reported isError")
+    # MCP manager shape: non-zero exit_code with the error text in stderr.
+    if result.get("exit_code") not in (0, None):
+        return str(result.get("stderr") or result.get("stdout") or "tool returned non-zero exit code")
     return None
 
 
@@ -1495,7 +1509,7 @@ async def execute_live_safe_fill(
             _t("live_fill_result", label=repr(target["label"]), status="failed")
 
     verify_result = await mcp.call_tool(snapshot_tool, {})
-    verify_text = _text_from_payload(_content_payload(verify_result))
+    verify_text = _mcp_result_text(verify_result)
     for entry in filled:
         if entry["status"] != "dispatched":
             continue

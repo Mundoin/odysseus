@@ -372,3 +372,39 @@ def test_live_fill_unverified_values_reported_unknown():
     )
     assert report["succeeded_count"] == 0
     assert report["unknown_count"] == 7
+
+
+def test_live_fill_handles_mcp_manager_stdout_shape():
+    # The real MCP manager returns {"stdout","stderr","exit_code"} dicts.
+    from src.browser_operator import execute_live_safe_fill
+
+    class _StdoutMCP(_FakeMCP):
+        async def call_tool(self, name, args):
+            self.calls.append((name, dict(args)))
+            if name.endswith("browser_snapshot"):
+                snaps = [c for c in self.calls if c[0].endswith("browser_snapshot")]
+                text = SNAPSHOT_TEXT if len(snaps) == 1 else SNAPSHOT_TEXT + self.verify_text
+                return {"stdout": text, "stderr": "", "exit_code": 0}
+            return {"stdout": "ok", "stderr": "", "exit_code": 0}
+
+    verify = "\n".join(f"- text: {v}" for v in EXPECTED_VALUES.values())
+    mcp = _StdoutMCP(verify_text=verify)
+    report = asyncio.run(execute_live_safe_fill(mcp, PAGE_URL_LIVE, EXPECTED_VALUES))
+    assert report["succeeded_count"] == 7
+    assert report["exit_code"] == 0
+
+
+def test_live_fill_nonzero_exit_code_navigate_is_failure():
+    from src.browser_operator import execute_live_safe_fill
+
+    class _ExitCodeFailMCP(_FakeMCP):
+        async def call_tool(self, name, args):
+            if name.endswith("browser_navigate"):
+                return {"stdout": "", "stderr": "net::ERR_CONNECTION_REFUSED", "exit_code": 1}
+            return await super().call_tool(name, args)
+
+    report = asyncio.run(
+        execute_live_safe_fill(_ExitCodeFailMCP(), PAGE_URL_LIVE, EXPECTED_VALUES)
+    )
+    assert report["exit_code"] == 1
+    assert "ERR_CONNECTION_REFUSED" in report["error"]
