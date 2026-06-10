@@ -285,3 +285,90 @@ def test_router_version_log(caplog):
         f"version={router.ROUTER_VERSION}" in r.getMessage() for r in caplog.records
     )
     assert router.ROUTER_VERSION == "live-proof-router-diagnostics-v1"
+
+
+# ── Live execution bridge (navigate → snapshot → type → verify) ─────────────
+
+
+PAGE_URL_LIVE = "http://127.0.0.1:8765/odysseus-smoke-form.html"
+
+SNAPSHOT_TEXT = """
+- textbox "First name" [ref=e3]
+- textbox "Last name" [ref=e5]
+- textbox "Email" [ref=e7]
+- textbox "Phone" [ref=e9]
+- textbox "City" [ref=e11]
+- textbox "Postcode" [ref=e13]
+- textbox "Cover letter" [ref=e15]
+- textbox "Password - should NOT be filled" [ref=e17]
+- button "Apply now" [ref=e21]
+"""
+
+
+class _FakeMCP:
+    def __init__(self, verify_text=""):
+        self.calls = []
+        self.verify_text = verify_text
+
+    def get_all_tools(self):
+        return [
+            {"name": "mcp__builtin_browser__browser_navigate"},
+            {"name": "mcp__builtin_browser__browser_snapshot"},
+            {"name": "mcp__builtin_browser__browser_type"},
+        ]
+
+    async def call_tool(self, name, args):
+        self.calls.append((name, dict(args)))
+        if name.endswith("browser_snapshot"):
+            snapshots = [c for c in self.calls if c[0].endswith("browser_snapshot")]
+            text = SNAPSHOT_TEXT if len(snapshots) == 1 else SNAPSHOT_TEXT + self.verify_text
+            return {"content": [{"type": "text", "text": text}]}
+        return {"content": [{"type": "text", "text": "ok"}]}
+
+
+def test_live_fill_navigates_types_safe_fields_and_verifies():
+    from src.browser_operator import execute_live_safe_fill
+
+    verify = "\n".join(f"- text: {v}" for v in EXPECTED_VALUES.values())
+    mcp = _FakeMCP(verify_text=verify)
+    report = asyncio.run(
+        execute_live_safe_fill(mcp, PAGE_URL_LIVE, EXPECTED_VALUES, trace="t-live")
+    )
+
+    nav_calls = [c for c in mcp.calls if c[0].endswith("browser_navigate")]
+    assert nav_calls == [("mcp__builtin_browser__browser_navigate", {"url": PAGE_URL_LIVE})]
+    type_calls = [c for c in mcp.calls if c[0].endswith("browser_type")]
+    assert len(type_calls) == 7
+    typed_refs = {c[1]["ref"] for c in type_calls}
+    assert "e17" not in typed_refs  # password textbox never typed
+    assert report["succeeded_count"] == 7
+    assert report["failed_count"] == 0
+    assert any("Password" in b["label"] for b in report["blocked_actions"])
+    assert report["exit_code"] == 0
+
+
+def test_live_fill_navigate_failure_is_explicit():
+    from src.browser_operator import execute_live_safe_fill
+
+    class _NavFailMCP(_FakeMCP):
+        async def call_tool(self, name, args):
+            if name.endswith("browser_navigate"):
+                return {"error": "net::ERR_CONNECTION_REFUSED", "exit_code": 1}
+            return await super().call_tool(name, args)
+
+    report = asyncio.run(
+        execute_live_safe_fill(_NavFailMCP(), PAGE_URL_LIVE, EXPECTED_VALUES)
+    )
+    assert "navigation" in report["error"].lower()
+    assert report["exit_code"] == 1
+
+
+def test_live_fill_unverified_values_reported_unknown():
+    from src.browser_operator import execute_live_safe_fill
+
+    mcp = _FakeMCP(verify_text="")  # post-fill snapshot shows nothing
+    report = asyncio.run(
+        execute_live_safe_fill(mcp, PAGE_URL_LIVE, EXPECTED_VALUES)
+    )
+    assert report["succeeded_count"] == 0
+    assert report["unknown_count"] == 7

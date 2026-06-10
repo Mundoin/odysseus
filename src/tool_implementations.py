@@ -4935,72 +4935,19 @@ async def do_browser_operator_safe_fill(
             "suggestion": "Install and connect a Playwright MCP server with full browser tool support.",
         }
 
-    # Build fill calls with tool name discovery
-    bridge = build_safe_browser_fill_calls(
-        form_fill_plan,
-        known_values,
-        batch_size=batch_size,
-        fill_tool_name=None,
-        snapshot_tool_name=None,
-        mcp_mgr=mcp,
-    )
+    # Live execution: navigate to the approved page, resolve field refs from
+    # a fresh snapshot, type only safe matched fields, verify via a post-fill
+    # snapshot. The old batch path assumed the model had already opened the
+    # page and that field refs existed — live that produced 0 filled and all
+    # fields unverified because the browser was never on the page.
+    from src.browser_operator import execute_live_safe_fill
 
-    batches = bridge.get("batches", [])
-    if not batches:
+    try:
+        return await execute_live_safe_fill(mcp, page_url, known_values)
+    except Exception as exc:
+        logger.warning("[browser_operator_safe_fill] Live fill execution failed: %s", exc)
         return {
-            "output": "No safe fill fields to execute. All fields were skipped or blocked.",
-            "skipped": bridge.get("skipped", []),
-            "blocked_actions": bridge.get("blocked_actions", []),
-            "exit_code": 0,
+            "error": f"Safe fill execution failed: {exc}",
+            "diagnostic": {"page_url": page_url, "exception": str(exc)},
+            "exit_code": 1,
         }
-
-    # Execute each batch
-    all_calls = []
-    all_skipped = list(bridge.get("skipped", []))
-    all_blocked = list(bridge.get("blocked_actions", []))
-    succeeded = 0
-    failed = 0
-    unknown = 0
-
-    for batch in batches:
-        try:
-            report = await execute_safe_browser_fill_batch(
-                mcp,
-                batch,
-                snapshot_tool_name=bridge.get("snapshot_tool_name", "mcp__builtin_browser__browser_snapshot"),
-            )
-            all_calls.extend(report.get("filled", []))
-            all_skipped.extend(report.get("skipped", []))
-            succeeded += report.get("succeeded_count", 0)
-            failed += report.get("failed_count", 0)
-            unknown += report.get("unknown_count", 0)
-        except Exception as exc:
-            logger.warning("[browser_operator_safe_fill] Batch execution failed: %s", exc)
-            for call in batch:
-                all_calls.append({
-                    "field_ref": call.get("field_ref", ""),
-                    "label": call.get("label", ""),
-                    "name": call.get("name", ""),
-                    "status": "failed",
-                    "reason": f"execution error: {exc}",
-                })
-                failed += 1
-
-    return {
-        "output": (
-            f"Safe fill completed. {succeeded} fields filled, {failed} failed, "
-            f"{unknown} could not be verified. {len(all_skipped)} skipped, "
-            f"{len(all_blocked)} blocked."
-        ),
-        "succeeded_count": succeeded,
-        "failed_count": failed,
-        "unknown_count": unknown,
-        "filled": all_calls,
-        "skipped": all_skipped,
-        "blocked_actions": all_blocked,
-        "page_url": page_url,
-        "fill_tool_name": bridge.get("fill_tool_name", ""),
-        "snapshot_tool_name": bridge.get("snapshot_tool_name", ""),
-        "raw_value_policy": "Raw values were used only for immediate browser fill dispatch and are not persisted in this output.",
-        "exit_code": 0,
-    }

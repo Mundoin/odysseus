@@ -1352,3 +1352,186 @@ def format_browser_observation(tool: str, result: dict[str, Any]) -> str | None:
         label = tool.rsplit("__", 1)[-1] if "__" in tool else tool
         return f"Browser observation ({label}): screenshot captured."
     return None
+
+
+# ── Live safe-fill execution bridge ─────────────────────────────────────────
+# The confirmed phase of browser_operator_safe_fill must not assume the model
+# already navigated or that field refs exist: it navigates to the approved
+# page, snapshots, resolves accessibility refs by label, types only safe
+# matched fields, and verifies against a fresh snapshot. All decisions emit
+# [form-fill-router] telemetry (labels/counts only, never raw values).
+
+_SNAPSHOT_FIELD_RE = re.compile(
+    r"-\s+(textbox|searchbox|combobox|checkbox|radio|slider)\s+\"([^\"]*)\""
+    r"[^\[\n]*\[ref=([\w.-]+)\]"
+)
+
+
+def parse_snapshot_fill_targets(snapshot_result: Any) -> list[dict[str, Any]]:
+    """Extract fillable accessibility nodes (role, label, ref) from a
+    Playwright MCP snapshot result."""
+    text = _text_from_payload(_content_payload(snapshot_result))
+    targets: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for match in _SNAPSHOT_FIELD_RE.finditer(text):
+        role, label, ref = match.groups()
+        if ref in seen:
+            continue
+        seen.add(ref)
+        targets.append({"role": role, "label": label, "ref": ref})
+    return targets
+
+
+def _tool_call_failed(result: Any) -> str | None:
+    if not isinstance(result, dict):
+        return None
+    if result.get("error"):
+        return str(result["error"])
+    if result.get("isError"):
+        return str(result.get("content") or "tool reported isError")
+    return None
+
+
+async def execute_live_safe_fill(
+    mcp: Any,
+    page_url: str,
+    known_values: dict[str, Any],
+    *,
+    trace: str | None = None,
+) -> dict[str, Any]:
+    """Navigate to ``page_url``, resolve field refs from a live snapshot and
+    type only safe, value-matched text fields. Verification is based on the
+    post-fill snapshot, never on model claims."""
+
+    def _t(phase: str, **fields: Any) -> None:
+        extra = " ".join(f"{k}={v}" for k, v in fields.items())
+        logger.info("[form-fill-router] trace=%s phase=%s %s", trace or "-", phase, extra)
+
+    nav_tool = _discover_browser_tool(
+        mcp, ("browser_navigate",),
+        fallback="mcp__builtin_browser__browser_navigate", tool_kind="navigate",
+    )
+    snapshot_tool = _discover_browser_tool(
+        mcp, ("browser_snapshot",),
+        fallback="mcp__builtin_browser__browser_snapshot", tool_kind="snapshot",
+    )
+    type_tool = _discover_browser_tool(
+        mcp, ("browser_type", "browser_fill"),
+        fallback="mcp__builtin_browser__browser_type", tool_kind="fill",
+    )
+
+    _t("live_fill_navigate", tool=nav_tool, url=page_url)
+    nav_result = await mcp.call_tool(nav_tool, {"url": page_url})
+    nav_error = _tool_call_failed(nav_result)
+    if nav_error:
+        _t("live_fill_navigate", result="failed", reason="navigate_failed")
+        return {
+            "error": f"Browser navigation to {page_url} failed: {nav_error}",
+            "diagnostic": {"navigate_tool": nav_tool, "navigate_error": nav_error},
+            "exit_code": 1,
+        }
+
+    snapshot_result = await mcp.call_tool(snapshot_tool, {})
+    snap_error = _tool_call_failed(snapshot_result)
+    if snap_error:
+        return {
+            "error": f"Browser snapshot failed after navigation: {snap_error}",
+            "diagnostic": {"snapshot_tool": snapshot_tool, "snapshot_error": snap_error},
+            "exit_code": 1,
+        }
+    targets = parse_snapshot_fill_targets(snapshot_result)
+    _t("live_fill_targets", count=len(targets))
+    if not targets:
+        return {
+            "error": "No fillable fields found in the live page snapshot",
+            "diagnostic": {
+                "page_url": page_url,
+                "snapshot_tool": snapshot_tool,
+                "reason": "snapshot contained no textbox/searchbox/combobox refs",
+            },
+            "exit_code": 1,
+        }
+
+    plan: list[tuple[dict[str, Any], str]] = []
+    skipped: list[dict[str, Any]] = []
+    blocked: list[dict[str, Any]] = []
+    used_keys: set[str] = set()
+    for target in targets:
+        field = {"label": target["label"], "name": "", "id": "", "type": target["role"]}
+        sensitive, why = _is_sensitive_form_field(field)
+        if sensitive:
+            blocked.append({"label": target["label"], "reason": why})
+            _t("live_fill_skip", label=repr(target["label"]), reason="sensitive_field")
+            continue
+        key = _known_value_key_for_field(field)
+        if not key or key in used_keys or key not in known_values or known_values.get(key) in (None, ""):
+            skipped.append({
+                "label": target["label"],
+                "reason": "no provided value matches this field",
+            })
+            _t("live_fill_skip", label=repr(target["label"]), reason="no_matching_value")
+            continue
+        used_keys.add(key)
+        plan.append((target, key))
+
+    succeeded = 0
+    failed = 0
+    unknown = 0
+    filled: list[dict[str, Any]] = []
+    for target, key in plan:
+        args = {"element": target["label"], "ref": target["ref"], "text": str(known_values[key])}
+        _t("live_fill_dispatch", tool=type_tool, label=repr(target["label"]), ref=target["ref"], value_key=key)
+        result = await mcp.call_tool(type_tool, args)
+        error = _tool_call_failed(result)
+        filled.append({
+            "field_ref": target["ref"],
+            "label": target["label"],
+            "value_source": f"known_values.{key}",
+            "status": "failed" if error else "dispatched",
+            **({"reason": error} if error else {}),
+        })
+        if error:
+            failed += 1
+            _t("live_fill_result", label=repr(target["label"]), status="failed")
+
+    verify_result = await mcp.call_tool(snapshot_tool, {})
+    verify_text = _text_from_payload(_content_payload(verify_result))
+    for entry in filled:
+        if entry["status"] != "dispatched":
+            continue
+        key = entry["value_source"].rsplit(".", 1)[-1]
+        value = str(known_values.get(key, ""))
+        if value and value in verify_text:
+            entry["status"] = "succeeded"
+            entry["reason"] = "value visible in post-fill browser snapshot"
+            succeeded += 1
+        else:
+            entry["status"] = "unknown"
+            entry["reason"] = "post-fill snapshot did not visibly confirm the value"
+            unknown += 1
+        _t("live_fill_result", label=repr(entry["label"]), status=entry["status"])
+        entry.pop("value", None)
+
+    _t(
+        "live_fill_summary",
+        succeeded=succeeded, failed=failed, unknown=unknown,
+        skipped=len(skipped), blocked=len(blocked),
+    )
+    return {
+        "output": (
+            f"Safe fill completed. {succeeded} fields filled and verified, "
+            f"{failed} failed, {unknown} could not be verified. "
+            f"{len(skipped)} skipped, {len(blocked)} blocked (sensitive)."
+        ),
+        "succeeded_count": succeeded,
+        "failed_count": failed,
+        "unknown_count": unknown,
+        "filled": filled,
+        "skipped": skipped,
+        "blocked_actions": blocked,
+        "page_url": page_url,
+        "fill_tool_name": type_tool,
+        "snapshot_tool_name": snapshot_tool,
+        "raw_value_policy": "Raw values were used only for immediate browser fill dispatch and are not persisted in this output.",
+        "exit_code": 0,
+    }
