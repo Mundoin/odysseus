@@ -100,3 +100,7 @@ _scratch/
 /odysseus_memory_seed_proposed.json
 /start-odysseus-hidden.ps1
 /stop-odysseus.ps1
+# Reasonix / local codegraph artifacts
+.reasonix/
+.codegraph/
+reasonix.toml
