@@ -4803,6 +4803,16 @@ async def do_browser_operator_safe_fill(
             fill_args_for_fingerprint,
             preview,
         )
+        # Also record the full request so the deterministic approval router
+        # can execute it backend-side without the model emitting a tool call.
+        from src.form_fill_router import record_pending_safe_fill
+        record_pending_safe_fill(
+            scope,
+            page_url=page_url,
+            known_values=known_values,
+            form_fill_plan=form_fill_plan,
+            batch_size=batch_size,
+        )
         # Redact sensitive fields for the output
         safe = confirmation_preview_for_event(enriched)
         return safe
@@ -4816,6 +4826,10 @@ async def do_browser_operator_safe_fill(
     }
 
     scope = browser_action_scope(session_id=session_id, owner=owner)
+    # The model-driven confirmed path consumes the router's pending entry too:
+    # one approval, one execution, regardless of which path fired first.
+    from src.form_fill_router import clear_pending_safe_fill
+    clear_pending_safe_fill(scope)
     if not consume_browser_pending_action(scope, tool_name, fill_args_for_fingerprint):
         # No matching pending action — someone changed the request or this is
         # a new session. Return a preview so the user can re-approve.
@@ -4855,6 +4869,14 @@ async def do_browser_operator_safe_fill(
         }
         scope = browser_action_scope(session_id=session_id, owner=owner)
         enriched = record_browser_pending_action(scope, tool_name, fill_args_for_fingerprint, preview)
+        from src.form_fill_router import record_pending_safe_fill
+        record_pending_safe_fill(
+            scope,
+            page_url=page_url,
+            known_values=known_values,
+            form_fill_plan=form_fill_plan,
+            batch_size=batch_size,
+        )
         return confirmation_preview_for_event(enriched)
 
     # Check that we have a browser MCP with fill tools

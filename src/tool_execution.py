@@ -342,9 +342,15 @@ async def _call_mcp_tool(
     qualified = f"mcp__{server_id}__{tool_name}"
     args = _build_mcp_args(tool, content)
     _confirmed = bool(args.pop("confirmed", False))
-    _block = _ext_guard_mcp(tool, args, _confirmed)
-    if _block is not None:
-        return _block
+    # Guard only applies to browser MCP tools — it classifies form-fill vs
+    # submit/upload/apply and returns a pending_confirmation preview.  Non-browser
+    # tools (bash, python, web_search, etc.) in _MCP_TOOL_MAP must NOT go through
+    # this guard: they would be misclassified as "external_write" and blocked.
+    from src.browser_operator import is_browser_mcp_tool_name
+    if is_browser_mcp_tool_name(qualified):
+        _block = _ext_guard_mcp(qualified, args, _confirmed)
+        if _block is not None:
+            return _block
     result = await mcp.call_tool(qualified, args)
 
     # If MCP server not connected, try direct fallback

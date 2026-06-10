@@ -1847,6 +1847,81 @@ async def stream_agent_loop(
         sorted(_intent.get("domains") or []),
         _retrieval_query[:200],
     )
+    # ── Deterministic approval router (browser safe fill) ──────────────────
+    # If a pending safe-fill preview exists for this chat and the user's
+    # message is an approval, the BACKEND executes browser_operator_safe_fill
+    # with confirmed=true right here — before any model tool choice. The model
+    # cannot stall or narrate its way out of an approved fill; it only gets
+    # the backend result to report. Plan mode and guide-only never execute.
+    _routed_fill = None
+    if not plan_mode and not guide_only:
+        try:
+            from src.form_fill_router import maybe_route_pending_browser_fill
+            _routed_fill = await maybe_route_pending_browser_fill(
+                _last_user, session_id=session_id, owner=owner
+            )
+        except Exception:
+            logger.exception("[fill-router] router failed; using normal agent flow")
+            _routed_fill = None
+    if _routed_fill:
+        messages = list(messages)
+        if _routed_fill.get("status") == "executed":
+            _fill_result = _routed_fill.get("result") or {}
+            _fill_cmd = f"approval-router confirmed fill: {_routed_fill.get('page_url', '')}"
+            yield 'data: ' + json.dumps({
+                "type": "tool_start",
+                "tool": "browser_operator_safe_fill",
+                "command": _fill_cmd,
+            }) + '\n\n'
+            _fill_output = (
+                _fill_result.get("output")
+                or _fill_result.get("error")
+                or json.dumps({k: v for k, v in _fill_result.items() if k != "filled"}, default=str)[:2000]
+            )
+            yield 'data: ' + json.dumps({
+                "type": "tool_output",
+                "tool": "browser_operator_safe_fill",
+                "command": _fill_cmd,
+                "output": _fill_output,
+                "exit_code": _fill_result.get("exit_code"),
+            }) + '\n\n'
+            _fill_summary = json.dumps(
+                {
+                    k: _fill_result.get(k)
+                    for k in (
+                        "output", "error", "succeeded_count", "failed_count",
+                        "unknown_count", "skipped", "blocked_actions", "page_url",
+                        "suggestion",
+                    )
+                    if k in _fill_result
+                },
+                default=str,
+            )[:4000]
+            messages.append({
+                "role": "user",
+                "content": (
+                    "[odysseus-backend] The user approved the pending safe form fill. "
+                    "Odysseus already executed browser_operator_safe_fill with "
+                    "confirmed=true on the backend. Verified result:\n"
+                    f"{_fill_summary}\n"
+                    "Report this exact result to the user. Do NOT call any browser "
+                    "or fill tools again for this batch, and do NOT ask for approval "
+                    "again. Password, upload and submit/apply controls were not "
+                    "touched and remain blocked."
+                ),
+            })
+        elif _routed_fill.get("status") == "expired":
+            _exp_msg = _routed_fill.get("message", "Pending safe fill approval expired.")
+            yield 'data: ' + json.dumps({"delta": _exp_msg + "\n\n"}) + '\n\n'
+            messages.append({
+                "role": "user",
+                "content": (
+                    "[odysseus-backend] The pending safe form fill approval expired and "
+                    "was cleared. Nothing was filled. Tell the user, and offer to "
+                    f"regenerate the preview. Diagnostic: {_exp_msg}"
+                ),
+            })
+
     _mcp_disabled_map = _load_mcp_disabled_map() if mcp_mgr else {}
     if plan_mode and mcp_mgr:
         # Allow read-only MCP tools to investigate, block write/unknown ones:
