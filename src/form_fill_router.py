@@ -109,6 +109,9 @@ def record_pending_safe_fill(
     known_values: Dict[str, Any],
     form_fill_plan: Optional[Dict[str, Any]] = None,
     batch_size: int = 3,
+    visible_mode: bool = True,
+    visible_fill_delay_ms: int = 550,
+    keep_browser_open: bool = True,
     ttl_seconds: float = PENDING_SAFE_FILL_TTL_SECONDS,
     trace: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -123,6 +126,9 @@ def record_pending_safe_fill(
         "known_values": dict(known_values),
         "form_fill_plan": form_fill_plan,
         "batch_size": batch_size,
+        "visible_mode": visible_mode,
+        "visible_fill_delay_ms": visible_fill_delay_ms,
+        "keep_browser_open": keep_browser_open,
         "created_at": now,
         "expires_at": now + ttl_seconds,
         "status": "pending_approval",
@@ -131,13 +137,30 @@ def record_pending_safe_fill(
     _tlog(
         trace, "pending_recorded",
         pending_id=entry["pending_id"], scope=scope,
-        values_count=len(known_values), ttl_seconds=int(ttl_seconds),
+        values_count=len(known_values), visible_mode=visible_mode,
+        delay_ms=visible_fill_delay_ms, ttl_seconds=int(ttl_seconds),
     )
     return entry
 
 
 def get_pending_safe_fill(scope: str) -> Optional[Dict[str, Any]]:
     return _PENDING_SAFE_FILL.get(scope)
+
+
+def has_pending_safe_fill(
+    session_id: Optional[str] = None, owner: Optional[str] = None
+) -> bool:
+    """True when this chat scope has an unexpired pending safe fill.
+
+    Approval turns ("approved") carry no browser keywords, so intent
+    detection marks them low-signal and the tool set collapses to
+    always-available tools only. The agent loop uses this check to force
+    browser tool relevance while an approval is still pending."""
+    scope = browser_action_scope(session_id=session_id, owner=owner)
+    entry = _PENDING_SAFE_FILL.get(scope)
+    if not entry or entry.get("kind") != "browser_safe_fill":
+        return False
+    return time.time() <= float(entry.get("expires_at", 0))
 
 
 def clear_pending_safe_fill(scope: Optional[str] = None, trace: Optional[str] = None) -> None:
@@ -284,6 +307,9 @@ async def maybe_route_initial_preview(
         "page_url": parsed["page_url"],
         "known_values": parsed["known_values"],
         "confirmed": False,
+        "visible_mode": True,
+        "visible_fill_delay_ms": 550,
+        "keep_browser_open": True,
         "_owner": owner,
         "_session_id": session_id,
         "_trace": trace,
@@ -322,7 +348,14 @@ async def maybe_route_pending_browser_fill(
     scope = browser_action_scope(session_id=session_id, owner=owner)
     pending = _PENDING_SAFE_FILL.get(scope)
     if not pending or pending.get("kind") != "browser_safe_fill":
-        _tlog(trace, "approval_check", result="miss", reason="no_pending", scope=scope)
+        # other_pending_scopes > 0 with a miss here means the preview was
+        # recorded under a different scope (session/owner mismatch between
+        # turns) — the classic "approved but nothing happened" diagnostic.
+        _tlog(
+            trace, "approval_check",
+            result="miss", reason="no_pending", scope=scope,
+            other_pending_scopes=len(_PENDING_SAFE_FILL),
+        )
         return None
 
     hit, reason = approval_check(user_message)
@@ -362,6 +395,9 @@ async def maybe_route_pending_browser_fill(
         "known_values": pending["known_values"],
         "confirmed": True,
         "batch_size": pending.get("batch_size", 3),
+        "visible_mode": pending.get("visible_mode", True),
+        "visible_fill_delay_ms": pending.get("visible_fill_delay_ms", 550),
+        "keep_browser_open": pending.get("keep_browser_open", True),
         "_owner": owner,
         "_session_id": session_id,
     }

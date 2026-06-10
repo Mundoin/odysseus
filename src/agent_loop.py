@@ -2006,6 +2006,26 @@ async def stream_agent_loop(
                 ),
             })
 
+    # ── Pending safe fill forces browser tool relevance ────────────────────
+    # Approval turns ("approved") carry no browser keywords, so intent
+    # detection marks them low-signal and the tool set collapses to
+    # ALWAYS_AVAILABLE — zero browser schemas. If this scope still has a
+    # pending safe fill (the approval router missed: not_approval, too_long,
+    # high_impact_word), force the browser domain so the pin below keeps
+    # browser_operator_safe_fill and the browser MCP tools in the schema set
+    # and the model can still act instead of claiming it has no browser tools.
+    if not (plan_mode or guide_only):
+        try:
+            from src.form_fill_router import has_pending_safe_fill
+            if has_pending_safe_fill(session_id=session_id, owner=owner):
+                _intent["domains"] = set(_intent.get("domains") or set()) | {"browser"}
+                logger.info(
+                    "[fill-router] pending safe fill for this scope; forcing "
+                    "browser tool relevance for this turn"
+                )
+        except Exception:
+            logger.exception("[fill-router] pending relevance check failed")
+
     _mcp_disabled_map = _load_mcp_disabled_map() if mcp_mgr else {}
     if plan_mode and mcp_mgr:
         # Allow read-only MCP tools to investigate, block write/unknown ones:

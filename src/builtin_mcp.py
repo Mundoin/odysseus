@@ -73,12 +73,40 @@ _BUILTIN_SERVERS = {
     "email":      ("mcp_servers/email_server.py",      "Built-in: Email"),
 }
 
+def _env_truthy(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def browser_mcp_headless() -> bool:
+    """Whether the built-in browser MCP launches headless (env-controlled).
+
+    Used by the live safe-fill result to prove whether the controlled
+    browser window can be visible to the user at all."""
+    return _env_truthy("ODYSSEUS_BROWSER_HEADLESS", default=False)
+
+
+def _browser_mcp_args() -> list[str]:
+    """Built-in Browser MCP launch args.
+
+    The visible fill proof stage needs a headed browser by default so Bujar can
+    watch approved fills happen. Set ODYSSEUS_BROWSER_HEADLESS=1 to restore the
+    older hidden/backend proof mode.
+    """
+    args = ["-y", "@playwright/mcp@latest", "--caps", "vision"]
+    if _env_truthy("ODYSSEUS_BROWSER_HEADLESS", default=False):
+        args.insert(2, "--headless")
+    return args
+
+
 # NPX-based built-in servers (run via npx, not Python)
 _BUILTIN_NPX_SERVERS = {
     "builtin_browser": {
         "name": "Built-in: Browser",
         "command": "npx",
-        "args": ["-y", "@playwright/mcp@latest", "--headless", "--caps", "vision"],
+        "args": _browser_mcp_args(),
     },
 }
 

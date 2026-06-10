@@ -18,6 +18,25 @@ def test_playwright_mcp_connection_error_includes_install_hint():
     assert "restart Odysseus" in msg
 
 
+def test_builtin_browser_mcp_defaults_to_visible(monkeypatch):
+    from src.builtin_mcp import _browser_mcp_args
+
+    monkeypatch.delenv("ODYSSEUS_BROWSER_HEADLESS", raising=False)
+    args = _browser_mcp_args()
+
+    assert args == ["-y", "@playwright/mcp@latest", "--caps", "vision"]
+    assert "--headless" not in args
+
+
+def test_builtin_browser_mcp_headless_env_keeps_hidden_mode(monkeypatch):
+    from src.builtin_mcp import _browser_mcp_args
+
+    monkeypatch.setenv("ODYSSEUS_BROWSER_HEADLESS", "1")
+    args = _browser_mcp_args()
+
+    assert args == ["-y", "@playwright/mcp@latest", "--headless", "--caps", "vision"]
+
+
 def test_generic_mcp_connection_error_preserves_original_error():
     msg = _format_mcp_connection_error(
         "Custom MCP",

@@ -4704,6 +4704,29 @@ async def do_browser_operator_safe_fill(
     fields_to_fill = args.get("fields_to_fill", None)
     confirmed = args.get("confirmed", False)
     batch_size = int(args.get("batch_size", 3) or 3)
+    visible_mode = args.get("visible_mode", None)
+    if visible_mode is None:
+        visible_mode = os.environ.get("ODYSSEUS_BROWSER_VISIBLE_FILL", "1").strip().lower() not in ("0", "false", "no", "off")
+    else:
+        visible_mode = bool(visible_mode)
+    try:
+        visible_fill_delay_ms = int(
+            args.get(
+                "visible_fill_delay_ms",
+                os.environ.get("ODYSSEUS_BROWSER_VISIBLE_FILL_DELAY_MS", "550"),
+            )
+            or 0
+        )
+    except (TypeError, ValueError):
+        visible_fill_delay_ms = 550
+    if not visible_mode:
+        visible_fill_delay_ms = 0
+    keep_browser_open = args.get("keep_browser_open", True)
+    if isinstance(keep_browser_open, str):
+        keep_browser_open = keep_browser_open.strip().lower() not in ("0", "false", "no", "off")
+    else:
+        keep_browser_open = bool(keep_browser_open)
+    trace = args.get("_trace")
 
     if not page_url:
         return {"error": "page_url is required", "exit_code": 1}
@@ -4791,8 +4814,11 @@ async def do_browser_operator_safe_fill(
             "sensitive_skipped": bridge.get("sensitive_skipped", 0),
             "redacted_value_objects": bridge.get("redacted_value_objects", {}),
             "batch_size": batch_size,
+            "visible_mode": visible_mode,
+            "visible_fill_delay_ms": visible_fill_delay_ms,
+            "keep_browser_open": keep_browser_open,
             "requires_review": True,
-            "instruction": "Review the redacted preview above. Call this tool again with confirmed=true to execute.",
+            "instruction": "Review this Fill preview. Call this tool again with confirmed=true after Fill approved to execute Browser visible fill.",
             "raw_value_policy": "Raw values are used only for immediate browser fill dispatch and are not persisted in public output or history.",
         }
 
@@ -4812,6 +4838,9 @@ async def do_browser_operator_safe_fill(
             known_values=known_values,
             form_fill_plan=form_fill_plan,
             batch_size=batch_size,
+            visible_mode=visible_mode,
+            visible_fill_delay_ms=visible_fill_delay_ms,
+            keep_browser_open=keep_browser_open,
         )
         # Redact sensitive fields for the output
         safe = confirmation_preview_for_event(enriched)
@@ -4876,6 +4905,9 @@ async def do_browser_operator_safe_fill(
             known_values=known_values,
             form_fill_plan=form_fill_plan,
             batch_size=batch_size,
+            visible_mode=visible_mode,
+            visible_fill_delay_ms=visible_fill_delay_ms,
+            keep_browser_open=keep_browser_open,
         )
         return confirmation_preview_for_event(enriched)
 
@@ -4888,6 +4920,7 @@ async def do_browser_operator_safe_fill(
                 "browser_fill_tool_available": False,
                 "mcp_server_name": None,
                 "missing_tool_names": ["browser_fill", "browser_type", "browser_select_option"],
+                "visible_mode": visible_mode,
             },
             "suggestion": "Connect a browser MCP server (e.g., @playwright/mcp) and restart Odysseus.",
         }
@@ -4943,7 +4976,15 @@ async def do_browser_operator_safe_fill(
     from src.browser_operator import execute_live_safe_fill
 
     try:
-        return await execute_live_safe_fill(mcp, page_url, known_values)
+        return await execute_live_safe_fill(
+            mcp,
+            page_url,
+            known_values,
+            trace=trace,
+            visible_mode=visible_mode,
+            visible_fill_delay_ms=visible_fill_delay_ms,
+            keep_browser_open=keep_browser_open,
+        )
     except Exception as exc:
         logger.warning("[browser_operator_safe_fill] Live fill execution failed: %s", exc)
         return {

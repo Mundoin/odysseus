@@ -108,6 +108,9 @@ def test_initial_request_routes_preview_backend_side(caplog):
     execute.assert_awaited_once()
     args = execute.await_args.args[0]
     assert args["confirmed"] is False
+    assert args["visible_mode"] is True
+    assert args["visible_fill_delay_ms"] == 550
+    assert args["keep_browser_open"] is True
     assert args["page_url"] == "http://127.0.0.1:8765/odysseus-smoke-form.html"
     assert args["known_values"] == EXPECTED_VALUES
     hits = _telemetry(caplog, "initial_preview_check")
@@ -178,6 +181,9 @@ def test_approval_executes_backend_with_telemetry(caplog):
     assert routed is not None and routed["status"] == "executed"
     execute.assert_awaited_once()
     assert execute.await_args.args[0]["confirmed"] is True
+    assert execute.await_args.args[0]["visible_mode"] is True
+    assert execute.await_args.args[0]["visible_fill_delay_ms"] == 550
+    assert execute.await_args.args[0]["keep_browser_open"] is True
     assert router.get_pending_safe_fill(SCOPE) is None
     assert any("result=hit" in m for m in _telemetry(caplog, "approval_check"))
     assert any(
@@ -343,8 +349,38 @@ def test_live_fill_navigates_types_safe_fields_and_verifies():
     assert "e17" not in typed_refs  # password textbox never typed
     assert report["succeeded_count"] == 7
     assert report["failed_count"] == 0
+    assert report["operator_visible_summary"]["label"] == "Browser fill proof"
+    assert report["browser_session_status"] == "open_after_fill"
     assert any("Password" in b["label"] for b in report["blocked_actions"])
     assert report["exit_code"] == 0
+
+
+def test_live_visible_fill_summary_and_delay_status():
+    from src.browser_operator import execute_live_safe_fill
+
+    verify = "\n".join(f"- text: {v}" for v in EXPECTED_VALUES.values())
+    mcp = _FakeMCP(verify_text=verify)
+    report = asyncio.run(
+        execute_live_safe_fill(
+            mcp,
+            PAGE_URL_LIVE,
+            EXPECTED_VALUES,
+            visible_mode=True,
+            visible_fill_delay_ms=0,
+            keep_browser_open=True,
+        )
+    )
+
+    summary = report["operator_visible_summary"]
+    assert summary["label"] == "Browser visible fill"
+    assert summary["fields_filled"] == 7
+    assert summary["fields_blocked"] == 1
+    assert any(f["label"] == "First name" for f in summary["filled_fields"])
+    assert any("Password" in f["label"] for f in summary["blocked_fields"])
+    assert report["visible_mode"] is True
+    assert report["keep_browser_open"] is True
+    assert report["browser_session_status"] == "open_after_fill"
+    assert "Browser visible fill completed" in report["output"]
 
 
 def test_live_fill_navigate_failure_is_explicit():
@@ -410,6 +446,55 @@ def test_live_fill_nonzero_exit_code_navigate_is_failure():
     assert "ERR_CONNECTION_REFUSED" in report["error"]
 
 
+def test_parse_snapshot_handles_bracketed_attributes_before_ref():
+    from src.browser_operator import parse_snapshot_fill_targets
+
+    text = '- textbox "First name" [active] [ref=e3]\n- textbox "Email" [ref=e7]'
+    targets = parse_snapshot_fill_targets({"content": [{"type": "text", "text": text}]})
+    assert {t["ref"] for t in targets} == {"e3", "e7"}
+
+
+def test_live_fill_reports_controlled_page_identity():
+    from src.browser_operator import execute_live_safe_fill
+
+    class _PageStateMCP(_FakeMCP):
+        async def call_tool(self, name, args):
+            if name.endswith("browser_navigate"):
+                self.calls.append((name, dict(args)))
+                text = (
+                    f"- Page URL: {PAGE_URL_LIVE}\n"
+                    "- Page Title: Odysseus Smoke Form\n"
+                )
+                return {"content": [{"type": "text", "text": text}]}
+            return await super().call_tool(name, args)
+
+    verify = "\n".join(f"- text: {v}" for v in EXPECTED_VALUES.values())
+    mcp = _PageStateMCP(verify_text=verify)
+    report = asyncio.run(execute_live_safe_fill(mcp, PAGE_URL_LIVE, EXPECTED_VALUES))
+
+    page = report["controlled_page"]
+    assert page["url"] == PAGE_URL_LIVE
+    assert page["title"] == "Odysseus Smoke Form"
+    assert page["fill_tool"].endswith("browser_type")
+    assert "headed" in page
+    assert f"Controlled page: {PAGE_URL_LIVE}" in report["output"]
+    assert report["operator_visible_summary"]["controlled_page"] == page
+
+
+def test_live_fill_zero_success_output_names_per_field_reasons():
+    from src.browser_operator import execute_live_safe_fill
+
+    mcp = _FakeMCP(verify_text="")  # post-fill snapshot confirms nothing
+    report = asyncio.run(execute_live_safe_fill(mcp, PAGE_URL_LIVE, EXPECTED_VALUES))
+
+    assert report["succeeded_count"] == 0
+    assert "Zero fields verified" in report["output"]
+    assert (
+        "First name: post-fill snapshot did not visibly confirm the value"
+        in report["output"]
+    )
+
+
 # ── Natural approval phrases (hf1) ───────────────────────────────────────────
 
 
@@ -455,4 +540,55 @@ def test_natural_approval_routes_pending_execution(caplog):
     assert any(
         "confirmed=True" in m and "called=True" in m
         for m in _telemetry(caplog, "approval_execute")
+    )
+
+
+# ── has_pending_safe_fill — approval-turn browser tool relevance ────────────
+
+
+def test_has_pending_safe_fill_true_while_pending_for_same_scope():
+    assert router.has_pending_safe_fill(session_id=SESSION) is False
+    router.record_pending_safe_fill(
+        SCOPE,
+        page_url="http://127.0.0.1:8765/odysseus-smoke-form.html",
+        known_values=EXPECTED_VALUES,
+    )
+    assert router.has_pending_safe_fill(session_id=SESSION) is True
+    assert router.has_pending_safe_fill(session_id="some-other-session") is False
+
+
+def test_has_pending_safe_fill_false_after_clear_and_after_expiry():
+    router.record_pending_safe_fill(
+        SCOPE,
+        page_url="http://127.0.0.1:8765/odysseus-smoke-form.html",
+        known_values=EXPECTED_VALUES,
+    )
+    router.clear_pending_safe_fill(SCOPE)
+    assert router.has_pending_safe_fill(session_id=SESSION) is False
+
+    entry = router.record_pending_safe_fill(
+        SCOPE,
+        page_url="http://127.0.0.1:8765/odysseus-smoke-form.html",
+        known_values=EXPECTED_VALUES,
+    )
+    entry["expires_at"] = time.time() - 1
+    assert router.has_pending_safe_fill(session_id=SESSION) is False
+
+
+def test_no_pending_miss_reports_other_pending_scopes(caplog):
+    """Scope mismatch diagnostic: pending exists, but under another scope."""
+    router.record_pending_safe_fill(
+        browser_action_scope(session_id="someone-elses-session"),
+        page_url="http://127.0.0.1:8765/odysseus-smoke-form.html",
+        known_values=EXPECTED_VALUES,
+    )
+    execute = AsyncMock()
+    with caplog.at_level(logging.INFO, logger=LOGGER):
+        routed = _approval_route("approved", execute)
+
+    assert routed is None
+    execute.assert_not_awaited()
+    assert any(
+        "reason=no_pending" in m and "other_pending_scopes=1" in m
+        for m in _telemetry(caplog, "approval_check")
     )

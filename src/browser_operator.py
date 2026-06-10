@@ -1,6 +1,7 @@
 """Small browser-operator helpers for MCP-backed browser tasks."""
 from __future__ import annotations
 
+import asyncio
 import copy
 import hashlib
 import json
@@ -1361,10 +1362,30 @@ def format_browser_observation(tool: str, result: dict[str, Any]) -> str | None:
 # matched fields, and verifies against a fresh snapshot. All decisions emit
 # [form-fill-router] telemetry (labels/counts only, never raw values).
 
+# Lazy [^\n]*? instead of [^\[\n]* — snapshot lines may carry bracketed
+# attributes such as [active] or [disabled] before the [ref=...] token.
 _SNAPSHOT_FIELD_RE = re.compile(
     r"-\s+(textbox|searchbox|combobox|checkbox|radio|slider)\s+\"([^\"]*)\""
-    r"[^\[\n]*\[ref=([\w.-]+)\]"
+    r"[^\n]*?\[ref=([\w.-]+)\]"
 )
+
+# @playwright/mcp tool results carry a "Page state" block:
+#   - Page URL: http://...
+#   - Page Title: ...
+_PAGE_URL_RE = re.compile(r"(?im)^\s*-?\s*Page URL:\s*(\S+)")
+_PAGE_TITLE_RE = re.compile(r"(?im)^\s*-?\s*Page Title:\s*(.+?)\s*$")
+
+
+def _page_identity_from_text(text: str) -> dict[str, str]:
+    """Extract the controlled page URL/title from an MCP tool result text."""
+    info: dict[str, str] = {}
+    url_match = _PAGE_URL_RE.search(text or "")
+    if url_match:
+        info["url"] = url_match.group(1)
+    title_match = _PAGE_TITLE_RE.search(text or "")
+    if title_match:
+        info["title"] = title_match.group(1)
+    return info
 
 
 def _mcp_result_text(result: Any) -> str:
@@ -1412,6 +1433,9 @@ async def execute_live_safe_fill(
     known_values: dict[str, Any],
     *,
     trace: str | None = None,
+    visible_mode: bool = False,
+    visible_fill_delay_ms: int = 0,
+    keep_browser_open: bool = True,
 ) -> dict[str, Any]:
     """Navigate to ``page_url``, resolve field refs from a live snapshot and
     type only safe, value-matched text fields. Verification is based on the
@@ -1433,8 +1457,16 @@ async def execute_live_safe_fill(
         mcp, ("browser_type", "browser_fill"),
         fallback="mcp__builtin_browser__browser_type", tool_kind="fill",
     )
+    delay_seconds = max(0, int(visible_fill_delay_ms or 0)) / 1000
 
-    _t("live_fill_navigate", tool=nav_tool, url=page_url)
+    _t(
+        "live_fill_navigate",
+        tool=nav_tool,
+        url=page_url,
+        visible_mode=visible_mode,
+        delay_ms=int(visible_fill_delay_ms or 0),
+        keep_browser_open=keep_browser_open,
+    )
     nav_result = await mcp.call_tool(nav_tool, {"url": page_url})
     nav_error = _tool_call_failed(nav_result)
     if nav_error:
@@ -1442,8 +1474,21 @@ async def execute_live_safe_fill(
         return {
             "error": f"Browser navigation to {page_url} failed: {nav_error}",
             "diagnostic": {"navigate_tool": nav_tool, "navigate_error": nav_error},
+            "visible_mode": visible_mode,
+            "browser_session_status": "navigation_failed",
             "exit_code": 1,
         }
+    if delay_seconds:
+        await asyncio.sleep(delay_seconds)
+
+    # Proof of which browser/page this run controls. The navigate result is
+    # the authoritative source; the snapshot is the fallback.
+    controlled_page = _page_identity_from_text(_mcp_result_text(nav_result))
+    try:
+        from src.builtin_mcp import browser_mcp_headless
+        headed: bool | None = not browser_mcp_headless()
+    except Exception:
+        headed = None
 
     snapshot_result = await mcp.call_tool(snapshot_tool, {})
     snap_error = _tool_call_failed(snapshot_result)
@@ -1451,10 +1496,22 @@ async def execute_live_safe_fill(
         return {
             "error": f"Browser snapshot failed after navigation: {snap_error}",
             "diagnostic": {"snapshot_tool": snapshot_tool, "snapshot_error": snap_error},
+            "visible_mode": visible_mode,
+            "browser_session_status": "snapshot_failed",
             "exit_code": 1,
         }
+    if not controlled_page:
+        controlled_page = _page_identity_from_text(_mcp_result_text(snapshot_result))
+    _t(
+        "live_fill_page",
+        url=controlled_page.get("url", "unknown"),
+        title=repr(controlled_page.get("title", "")),
+        headed=headed,
+        fill_tool=type_tool,
+    )
+
     targets = parse_snapshot_fill_targets(snapshot_result)
-    _t("live_fill_targets", count=len(targets))
+    _t("live_fill_targets", count=len(targets), labels=repr([t["label"] for t in targets][:12]))
     if not targets:
         return {
             "error": "No fillable fields found in the live page snapshot",
@@ -1463,6 +1520,8 @@ async def execute_live_safe_fill(
                 "snapshot_tool": snapshot_tool,
                 "reason": "snapshot contained no textbox/searchbox/combobox refs",
             },
+            "visible_mode": visible_mode,
+            "browser_session_status": "open_after_navigation" if keep_browser_open else "managed_by_browser_mcp",
             "exit_code": 1,
         }
 
@@ -1496,7 +1555,11 @@ async def execute_live_safe_fill(
         # @playwright/mcp browser_type takes `target` (a snapshot ref) + `text`.
         args = {"target": target["ref"], "text": str(known_values[key])}
         _t("live_fill_dispatch", tool=type_tool, label=repr(target["label"]), ref=target["ref"], value_key=key)
+        if delay_seconds:
+            await asyncio.sleep(delay_seconds)
         result = await mcp.call_tool(type_tool, args)
+        if delay_seconds:
+            await asyncio.sleep(delay_seconds)
         error = _tool_call_failed(result)
         filled.append({
             "field_ref": target["ref"],
@@ -1535,16 +1598,86 @@ async def execute_live_safe_fill(
         "live_fill_summary",
         succeeded=succeeded, failed=failed, unknown=unknown,
         skipped=len(skipped), blocked=len(blocked),
+        visible_mode=visible_mode,
+        browser_session_status="open_after_fill" if keep_browser_open else "managed_by_browser_mcp",
     )
+
+    zero_fill_diagnosis = ""
+    if succeeded == 0:
+        # Exact per-field reasons so a "completed but empty form" report is
+        # never ambiguous: dispatch failures, unverified values and skips.
+        reasons = [
+            f"{entry['label']}: {entry['reason']}"
+            for entry in filled
+            if entry.get("reason")
+        ] + [f"{item['label']}: {item['reason']}" for item in skipped]
+        _t(
+            "live_fill_zero_diagnosis",
+            reasons=repr(redact_sensitive_text("; ".join(reasons))[:400]),
+        )
+        if reasons:
+            zero_fill_diagnosis = (
+                " Zero fields verified — per-field reasons: " + "; ".join(reasons[:8])
+            )
+
+    controlled_page_report = dict(controlled_page)
+    if headed is not None:
+        controlled_page_report["headed"] = headed
+    controlled_page_report["fill_tool"] = type_tool
+    page_proof = (
+        f" Controlled page: {controlled_page.get('url') or 'unknown'}"
+        + (f" ({controlled_page['title']!r})" if controlled_page.get("title") else "")
+        + (f", headed={headed}" if headed is not None else "")
+        + f", via {type_tool}."
+    )
+
+    result_summary = {
+        "label": "Browser visible fill" if visible_mode else "Browser fill proof",
+        "fields_filled": succeeded,
+        "fields_failed": failed,
+        "fields_unverified": unknown,
+        "fields_skipped": len(skipped),
+        "fields_blocked": len(blocked),
+        "filled_fields": [
+            {
+                "label": item.get("label", ""),
+                "name": item.get("name", ""),
+                "field_ref": item.get("field_ref", ""),
+                "status": item.get("status", ""),
+            }
+            for item in filled
+        ],
+        "skipped_fields": [
+            {"label": item.get("label", ""), "name": item.get("name", ""), "reason": item.get("reason", "")}
+            for item in skipped
+        ],
+        "blocked_fields": [
+            {"label": item.get("label", ""), "name": item.get("name", ""), "reason": item.get("reason", "")}
+            for item in blocked
+        ],
+        "browser_session_status": "open_after_fill" if keep_browser_open else "managed_by_browser_mcp",
+        "controlled_page": controlled_page_report,
+    }
     return {
         "output": (
-            f"Safe fill completed. {succeeded} fields filled and verified, "
+            f"{result_summary['label']} completed. {succeeded} fields filled and verified, "
             f"{failed} failed, {unknown} could not be verified. "
-            f"{len(skipped)} skipped, {len(blocked)} blocked (sensitive)."
+            f"{len(skipped)} skipped, {len(blocked)} blocked. "
+            f"Browser/session status: {result_summary['browser_session_status']}."
+            + page_proof
+            + zero_fill_diagnosis
         ),
+        "controlled_page": controlled_page_report,
+        "operator_visible_summary": result_summary,
+        "visible_mode": visible_mode,
+        "visible_fill_delay_ms": int(visible_fill_delay_ms or 0),
+        "keep_browser_open": keep_browser_open,
+        "browser_session_status": result_summary["browser_session_status"],
         "succeeded_count": succeeded,
         "failed_count": failed,
         "unknown_count": unknown,
+        "skipped_count": len(skipped),
+        "blocked_count": len(blocked),
         "filled": filled,
         "skipped": skipped,
         "blocked_actions": blocked,

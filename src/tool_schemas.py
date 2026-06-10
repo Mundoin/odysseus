@@ -1186,7 +1186,7 @@ FUNCTION_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "browser_operator_safe_fill",
-            "description": "Fill safe non-sensitive text-like form fields on the current browser page. Two-phase: first call returns a redacted preview requiring user approval; re-call with confirmed=true to execute. Blocks password, file upload, payment, submit, apply, and sensitive fields. After execution, verifies filled fields with a browser snapshot and returns a redacted report. Use this for ANY form-fill intent: 'fill the form', 'type in my details', 'autofill this page', 'populate the fields', 'fill safe fields', 'fill only text fields'. Do NOT call low-level browser_fill/browser_type MCP tools directly — use this single operator tool instead.",
+            "description": "Fill safe non-sensitive text-like form fields on the current browser page. Two-phase: first call returns a redacted Fill preview requiring user approval; re-call with confirmed=true after Fill approved to execute Browser visible fill by default. Blocks password, file upload, payment, submit, apply, and sensitive fields. After execution, verifies filled fields with a browser snapshot and returns a redacted Fields filled report. Use this for ANY form-fill intent: 'fill the form', 'type in my details', 'autofill this page', 'populate the fields', 'fill safe fields', 'fill only text fields'. Do NOT call low-level browser_fill/browser_type MCP tools directly — use this single operator tool instead.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1195,7 +1195,10 @@ FUNCTION_TOOL_SCHEMAS = [
                     "form_fill_plan": {"type": "object", "description": "Optional: the complete form-fill plan dict from build_form_fill_plan (page_inventory output). Pass the full plan including fill_steps, missing_values, sensitive_values, upload_steps, blocked_actions."},
                     "fields_to_fill": {"type": "array", "items": {"type": "string"}, "description": "Optional: specific field refs/labels to fill. If omitted, fills all safe mapped fields from the plan."},
                     "confirmed": {"type": "boolean", "description": "Set to true to execute after user approval. Omit on first call to receive a redacted preview."},
-                    "batch_size": {"type": "integer", "description": "How many fields to fill per batch before verifying (default 3)."}
+                    "batch_size": {"type": "integer", "description": "How many fields to fill per batch before verifying (default 3)."},
+                    "visible_mode": {"type": "boolean", "description": "When true (default), run the approved fill as Browser visible fill and report the visible proof/session status. Set false only for hidden/backend proof mode."},
+                    "visible_fill_delay_ms": {"type": "integer", "description": "Delay before/after each field fill in visible mode so the operator can watch fields fill (default 550ms)."},
+                    "keep_browser_open": {"type": "boolean", "description": "Leave the browser/page open after execution when true (default)."}
                 },
                 "required": ["page_url", "known_values"]
             }

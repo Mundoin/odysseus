@@ -687,7 +687,8 @@ class McpManager:
                 missing_runtime_message += (
                     "\nNo browser MCP server is configured. "
                     "Add one via Settings → MCP Servers: command=npx, "
-                    "args=-y @playwright/mcp@latest --headless --caps vision"
+                    "args=-y @playwright/mcp@latest --caps vision "
+                    "(add --headless only for hidden/backend proof mode)"
                 )
             else:
                 offline = [s for s in browser_servers if s["status"] != "connected"]
