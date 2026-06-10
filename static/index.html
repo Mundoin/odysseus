@@ -1325,6 +1325,10 @@
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><circle cx="6" cy="6" r="1"/><circle cx="6" cy="18" r="1"/></svg>
             <span>Add Models</span>
           </button>
+          <button class="settings-nav-item" data-settings-tab="added-models">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+            <span>Added Models</span>
+          </button>
           <button class="settings-nav-item" data-settings-tab="ai">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a4 4 0 0 0-4 4v2H6a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V10a2 2 0 0 0-2-2h-2V6a4 4 0 0 0-4-4z"/></svg>
             <span>AI Defaults</span>
@@ -1557,21 +1561,12 @@
               <div id="set-ttsSettingsMsg" style="font-size:11px;color:color-mix(in srgb, var(--fg) 45%, transparent);"></div>
             </div>
           </div>
-          <div class="admin-card">
-            <h2 style="display:flex;align-items:center;gap:6px;"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:5px;opacity:0.6"><path d="M22 10v6M2 10l10-5 10 5-10 5z"/><path d="M6 12v5c3 3 9 3 12 0v-5"/></svg>Teacher Model <span style="font-size:0.72em;opacity:0.55;font-weight:normal;">(Experimental)</span><span style="flex:1"></span><label class="admin-switch"><input type="checkbox" id="set-teacherEnabledToggle"><span class="admin-slider"></span></label></h2>
-            <div class="admin-toggle-sub" style="margin-bottom:8px">When a self-hosted student fails an agent-mode task, escalate to a SOTA teacher that writes a SKILL.md procedure so the student can do it next time. Off by default.</div>
-            <div class="settings-col">
-              <div class="settings-row">
-                <label class="settings-label">Endpoint</label>
-                <select id="set-teacherEpSelect" class="settings-select"><option value="">—</option></select>
-              </div>
-              <div class="settings-row">
-                <label class="settings-label">Model</label>
-                <select id="set-teacherModelSelect" class="settings-select"><option value="">—</option></select>
-              </div>
-              <div id="set-teacherChatMsg" style="font-size:11px;color:color-mix(in srgb, var(--fg) 45%, transparent);"></div>
-            </div>
-          </div>
+          <!-- Teacher Model settings card hidden as part of the 2.0
+               "harden the core" pass. The escalation flow is dormant when
+               `teacher_model` is unset (its default), so the backend keeps
+               working for anyone who wired it via `manage_settings` /
+               settings backup. Re-add this card to surface the toggle
+               again once the core experience is faster. -->
         </div>
 
         <!-- ═══ SEARCH TAB ═══ -->
@@ -2007,37 +2002,29 @@
 
         <!-- ═══ SERVICES TAB ═══ -->
         <div data-settings-panel="services">
-          <div class="admin-card">
-            <h2><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:5px;opacity:0.6"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><circle cx="6" cy="6" r="1"/><circle cx="6" cy="18" r="1"/></svg>Add Models <span style="opacity:0.45;font-weight:normal;font-size:0.82em">(Endpoints)</span></h2>
-            <div class="admin-toggle-sub" style="margin-bottom:10px">Connect local models first, or add a cloud API.</div>
 
-            <!-- Local subsection -->
-            <div class="adm-add-section collapsible collapsed" id="adm-add-local">
-              <div class="adm-ep-section-head adm-section-toggle" role="button" tabindex="0" aria-expanded="false">
-                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px;margin-right:4px;"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8"/><path d="M12 17v4"/></svg>
-                <span>Local</span>
-                <svg class="adm-section-caret" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
-              </div>
+          <!-- ── Local card ─────────────────────────────────────────── -->
+          <div class="admin-card">
+            <h2 style="display:flex;align-items:center;gap:8px;"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:5px;opacity:0.6"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8"/><path d="M12 17v4"/></svg>Local Models</h2>
+            <div class="admin-toggle-sub" style="margin:0 0 10px 2px;">Add a local model server (Ollama, llama.cpp, vLLM).</div>
+            <div class="adm-add-section">
               <div class="admin-model-form">
                 <div class="admin-model-form-row">
-                  <input id="adm-epLocalUrl" type="text" placeholder="Paste endpoint URL, e.g. http://localhost:11434/v1" style="flex:1">
+                  <div class="adm-fused-group" style="display:flex;flex:1 1 180px;min-width:0;">
+                    <select id="adm-epLocalType" style="padding:5px;width:62px;flex-shrink:0;border-top-right-radius:0;border-bottom-right-radius:0;border-right:0;">
+                      <option value="llm" selected>LLM</option>
+                      <option value="image">Image</option>
+                    </select>
+                    <input id="adm-epLocalUrl" type="text" placeholder="Paste endpoint URL, e.g. http://localhost:11434/v1" style="flex:1;min-width:0;border-top-left-radius:0;border-bottom-left-radius:0;">
+                  </div>
+                  <button class="admin-btn-add" id="adm-epLocalAddBtn" style="min-width:55px;text-align:center;display:inline-flex;align-items:center;justify-content:center;gap:4px;flex-shrink:0;">
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>Add
+                  </button>
                 </div>
-                <!-- API key row stays in the DOM but is collapsed until the
-                     user clicks the Key button on the action row. Local
-                     endpoints rarely need a key; hiding it by default keeps
-                     the form a single visual line. -->
                 <div class="admin-model-form-row" id="adm-epLocalApiKey-row" style="display:none;">
                   <input id="adm-epLocalApiKey" type="password" placeholder="API key (optional — for protected local endpoints)" autocomplete="off" style="flex:1">
                 </div>
-                <!-- Action row: LLM/Image type, Quickstart buttons (Scan,
-                     Ollama), Key reveal toggle, Test, Add — all inline so
-                     the Quickstart fold is gone and Type sits with the
-                     primary actions. -->
                 <div class="admin-model-form-row">
-                  <label style="display:inline-flex;align-items:center;gap:4px;font-size:11px;opacity:0.6;flex-shrink:0;">Type:<select id="adm-epLocalType" style="padding:5px;width:72px;flex-shrink:0;">
-                    <option value="llm" selected>LLM</option>
-                    <option value="image">Image</option>
-                  </select></label>
                   <button class="admin-btn-sm" id="adm-epDiscoverBtn" title="Scan your network for running model servers" style="display:inline-flex;align-items:center;gap:4px;">
                     <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>Scan
                   </button>
@@ -2049,25 +2036,18 @@
                   <button class="admin-btn-sm" id="adm-epLocalTestBtn" style="min-width:55px;text-align:center;display:inline-flex;align-items:center;justify-content:center;gap:4px;">
                     <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>Test
                   </button>
-                  <button class="admin-btn-add" id="adm-epLocalAddBtn" style="min-width:55px;text-align:center;display:inline-flex;align-items:center;justify-content:center;gap:4px;">
-                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>Add
-                  </button>
                 </div>
                 <div id="adm-epLocalMsg" class="adm-ep-inline-msg"></div>
               </div>
             </div>
+          </div>
 
-            <!-- API subsection -->
-            <div class="adm-add-section collapsible collapsed" id="adm-add-api" style="margin-top:14px">
-              <div class="adm-ep-section-head adm-section-toggle" role="button" tabindex="0" aria-expanded="false">
-                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px;margin-right:4px;"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
-                <span>API</span>
-                <svg class="adm-section-caret" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
-              </div>
+          <!-- ── API card ───────────────────────────────────────────── -->
+          <div class="admin-card">
+            <h2 style="display:flex;align-items:center;gap:8px;"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:5px;opacity:0.6"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>API Models</h2>
+            <div class="admin-toggle-sub" style="margin:0 0 10px 2px;">Connect a cloud provider (OpenAI, Anthropic, DeepSeek, OpenRouter, etc.).</div>
+            <div class="adm-add-section">
               <div class="admin-model-form">
-                <!-- Custom picker (with logos). Hidden native <select> mirrors
-                     its value so the existing JS that reads adm-epProvider
-                     keeps working unchanged. -->
                 <div class="adm-provider-picker adm-provider-combo" id="adm-provider-picker">
                   <input id="adm-epUrl" type="text" placeholder="Base URL or pick provider" autocomplete="off">
                   <button type="button" class="adm-provider-btn" id="adm-provider-btn" title="Pick provider">
@@ -2097,11 +2077,7 @@
                   <option value="https://api.z.ai/api/coding/paas/v4" data-logo="zhipu">Z.AI Coding Plan</option>
                   <option value="https://integrate.api.nvidia.com/v1" data-logo="nvidia">NVIDIA</option>
                 </select>
-                <!-- API key row stays in DOM, hidden until Key button is
-                     clicked. Mirrors the Local section pattern: most users
-                     paste a key via the provider preset flow rather than
-                     typing it free-form, so the row only appears on demand. -->
-                <div class="admin-model-form-row" id="adm-epApiKey-row" style="display:none;">
+                <div class="admin-model-form-row" id="adm-epApiKey-row">
                   <input id="adm-epApiKey" type="password" placeholder="API key" autocomplete="off" style="flex:1">
                 </div>
                 <div class="admin-model-form-row" style="margin-top:-4px;">
@@ -2114,9 +2090,6 @@
                     <option value="image">Image</option>
                   </select></label>
                   <span style="flex:1"></span>
-                  <button class="admin-btn-sm" id="adm-epApiKeyBtn" title="Show / hide the API key field" aria-expanded="false" aria-controls="adm-epApiKey-row" style="opacity:0.75;display:inline-flex;align-items:center;gap:4px;">
-                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2l-9.6 9.6"/><circle cx="7.5" cy="15.5" r="5.5"/><path d="M15.5 7.5l3 3"/></svg>API
-                  </button>
                   <button class="admin-btn-sm" id="adm-epApiTestBtn" style="min-width:55px;text-align:center;display:inline-flex;align-items:center;justify-content:center;gap:4px;">
                     <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>Test
                   </button>
@@ -2130,8 +2103,13 @@
               </div>
             </div>
           </div>
+
+        </div>
+
+        <!-- ═══ ADDED MODELS TAB ═══ -->
+        <div data-settings-panel="added-models" class="hidden">
           <div class="admin-card">
-            <h2 style="display:flex;align-items:center;gap:8px;"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:5px;opacity:0.6"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>Added Models <span style="opacity:0.45;font-weight:normal;font-size:0.82em">(Endpoints)</span>
+            <h2 style="display:flex;align-items:center;gap:8px;"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:5px;opacity:0.6"><polyline points="20 6 9 17 4 12"/></svg>Added Models <span style="opacity:0.45;font-weight:normal;font-size:0.82em">(Endpoints)</span>
               <span style="flex:1"></span>
               <button class="admin-btn-sm" id="adm-epProbeAllBtn" title="Re-test every endpoint and refresh online status" style="font-size:11px;font-weight:normal;display:inline-flex;align-items:center;gap:4px;">
                 <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>Probe
@@ -2140,20 +2118,18 @@
                 <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>Clear offline <span id="adm-epOfflineCount" style="opacity:0.6;margin-left:2px;"></span>
               </button>
             </h2>
-            <div class="admin-toggle-sub" style="margin-bottom:10px">Manage the endpoints you've added.</div>
+            <div class="admin-toggle-sub" style="margin-bottom:12px">Endpoints you've connected. Probe re-tests them all; Clear offline removes the dead ones.</div>
             <div class="adm-ep-section">
-              <div class="adm-ep-section-head">
-                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px;margin-right:4px;"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8"/><path d="M12 17v4"/></svg>
-                <span>Local</span>
+              <div class="adm-ep-section-head" style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;opacity:0.7;margin-bottom:6px;display:inline-flex;align-items:center;gap:5px;">
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8"/><path d="M12 17v4"/></svg>Local
               </div>
               <div id="adm-epList-local"><div class="admin-empty">Loading...</div></div>
             </div>
-            <div class="adm-ep-section" style="margin-top:14px">
-              <div class="adm-ep-section-head">
-                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px;margin-right:4px;"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
-                <span>API</span>
+            <div class="adm-ep-section" style="margin-top:18px;">
+              <div class="adm-ep-section-head" style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;opacity:0.7;margin-bottom:6px;display:inline-flex;align-items:center;gap:5px;">
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>API
               </div>
-              <div id="adm-epList-api"></div>
+              <div id="adm-epList-api"><div class="admin-empty">No API endpoints yet.</div></div>
             </div>
           </div>
         </div>

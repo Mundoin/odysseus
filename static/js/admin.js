@@ -1168,7 +1168,6 @@ function initEndpointForm() {
     });
   };
   _wireKeyToggle('adm-epLocalKeyBtn', 'adm-epLocalApiKey-row');
-  _wireKeyToggle('adm-epApiKeyBtn', 'adm-epApiKey-row');
 
   // ── Added Models toolbar: Probe + Clear offline ────────────────────
   // Both buttons act over the currently-rendered endpoint list. The
@@ -1444,30 +1443,6 @@ function initEndpointForm() {
     });
   }
 
-  // Collapsible Add-Models subsections (API / Local). Both start collapsed
-  // so the card is compact; the last-used state is remembered per section
-  // in localStorage so a frequent API-adder doesn't re-expand every time.
-  document.querySelectorAll('#adm-add-api, #adm-add-local').forEach((sec) => {
-    const head = sec.querySelector('.adm-section-toggle');
-    if (!head) return;
-    const key = 'odysseus.addModels.' + sec.id + '.open';
-    let open = false;
-    try { open = localStorage.getItem(key) === '1'; } catch {}
-    const apply = () => {
-      sec.classList.toggle('collapsed', !open);
-      head.setAttribute('aria-expanded', open ? 'true' : 'false');
-    };
-    apply();
-    const toggle = () => {
-      open = !open;
-      try { localStorage.setItem(key, open ? '1' : '0'); } catch {}
-      apply();
-    };
-    head.addEventListener('click', toggle);
-    head.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); }
-    });
-  });
   document.querySelectorAll('.adm-quickstart-section').forEach((sec) => {
     const head = sec.querySelector('.adm-quickstart-toggle');
     if (!head) return;
