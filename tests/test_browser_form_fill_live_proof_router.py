@@ -408,3 +408,51 @@ def test_live_fill_nonzero_exit_code_navigate_is_failure():
     )
     assert report["exit_code"] == 1
     assert "ERR_CONNECTION_REFUSED" in report["error"]
+
+
+# ── Natural approval phrases (hf1) ───────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "message",
+    ["Yes Approved.", "Yes, approve and execute fill", "Yes I approve",
+     "Yes I approve, you can proceed, go!", "yes approved", "yes, approved",
+     "yes approve", "i approve", "you can proceed", "yes fill now",
+     "go ahead", "proceed", "do it", "ok", "okay"],
+)
+def test_natural_approval_phrases_accepted(message):
+    assert router.is_approval_message(message) is True, message
+
+
+@pytest.mark.parametrize(
+    "message",
+    ["Yes click apply now", "Yes upload the CV", "Yes submit it",
+     "Yes fill password", "yes send it", "yes pay and checkout",
+     "yes attach the file"],
+)
+def test_high_impact_phrases_still_blocked(message):
+    hit, reason = router.approval_check(message)
+    assert hit is False, message
+    assert reason == "high_impact_word", message
+
+
+def test_natural_approval_routes_pending_execution(caplog):
+    caplog.set_level(logging.INFO, logger=LOGGER)
+    router.record_pending_safe_fill(
+        SCOPE, page_url=PAGE_URL_LIVE, known_values=EXPECTED_VALUES
+    )
+    execute = AsyncMock(return_value={"output": "ok", "exit_code": 0})
+
+    routed = _approval_route("Yes I approve, you can proceed, go!", execute)
+
+    assert routed is not None and routed["status"] == "executed"
+    execute.assert_awaited_once()
+    assert execute.await_args.args[0]["confirmed"] is True
+    assert any(
+        "result=hit" in m and "reason=approval" in m
+        for m in _telemetry(caplog, "approval_check")
+    )
+    assert any(
+        "confirmed=True" in m and "called=True" in m
+        for m in _telemetry(caplog, "approval_execute")
+    )

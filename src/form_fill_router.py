@@ -55,6 +55,16 @@ _APPROVAL_RE = re.compile(
     r"fill(?: it| them| the form)?(?: in)?|fill|it|in|them|the form|now|then))*$"
 )
 
+# Natural approval sentences that don't fit the strict token chain above:
+# "Yes Approved.", "Yes, approve and execute fill", "Yes I approve, you can
+# proceed, go!". An unambiguous approval verb/phrase anywhere in a short,
+# high-impact-free message counts. Bare "yes"/"ok" stay strict-match only so
+# "yes, but ..." prose can't route by accident.
+_APPROVAL_INTENT_RE = re.compile(
+    r"\b(?:approved?|i approve|we approve|go ahead|you can proceed|proceed|"
+    r"do it|run it|execute(?: the)?(?: safe)? fill|fill (?:it|now|them))\b"
+)
+
 # Any of these in the message means the user is asking for MORE than the
 # approved safe fill — never route, let the normal guarded flow handle it.
 _HIGH_IMPACT_RE = re.compile(
@@ -154,9 +164,10 @@ def approval_check(text: str) -> Tuple[bool, str]:
         return False, "too_long"
     if _HIGH_IMPACT_RE.search(raw):
         return False, "high_impact_word"
-    if not _APPROVAL_RE.match(_normalise(raw)):
-        return False, "not_approval"
-    return True, "approval"
+    norm = _normalise(raw)
+    if _APPROVAL_RE.match(norm) or _APPROVAL_INTENT_RE.search(norm):
+        return True, "approval"
+    return False, "not_approval"
 
 
 def is_approval_message(text: str) -> bool:

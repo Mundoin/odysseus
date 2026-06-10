@@ -59,6 +59,20 @@ def _auth_disabled() -> bool:
     return os.getenv("AUTH_ENABLED", "true").lower() == "false"
 
 
+def localhost_bypass_active(request: Request) -> bool:
+    """True when LOCALHOST_BYPASS=true and the caller is loopback.
+
+    Mirrors the middleware / require_user dev bypass so owner-scoped checks
+    (e.g. chat_stream session ownership) agree with the layers that already
+    let the same caller through. Non-loopback callers are never bypassed.
+    """
+    if os.getenv("LOCALHOST_BYPASS", "false").lower() != "true":
+        return False
+    client = getattr(request, "client", None)
+    host = (client.host if client else "") or ""
+    return host in ("127.0.0.1", "::1", "localhost")
+
+
 def require_user(request: Request) -> str:
     """FastAPI dependency: reject unauthenticated callers when the upstream
     auth middleware was bypassed unexpectedly (e.g. SSRF from a sibling

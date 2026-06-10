@@ -11,7 +11,7 @@ from core.session_manager import SessionManager
 from core.models import ChatMessage
 from src.request_models import SessionResponse
 from core.database import Session as DbSession, SessionLocal, Document, GalleryImage, utcnow_naive
-from src.auth_helpers import get_current_user, effective_user, _auth_disabled
+from src.auth_helpers import get_current_user, effective_user, _auth_disabled, localhost_bypass_active
 from src.session_actions import is_session_recently_active
 
 
@@ -102,7 +102,7 @@ def _verify_session_owner(request: Request, session_id: str, session_manager=Non
     rows created while auth was previously enabled.
     """
     user = effective_user(request)
-    if not user and not _auth_disabled():
+    if not user and not _auth_disabled() and not localhost_bypass_active(request):
         raise HTTPException(401, "Authentication required")
     db = SessionLocal()
     try:
