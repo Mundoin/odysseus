@@ -1855,6 +1855,7 @@ async def stream_agent_loop(
     # the backend result to report. Plan mode and guide-only never execute.
     _routed_fill = None
     _routed_preview = None
+    _had_pending_fill = False
     if plan_mode or guide_only:
         try:
             from src.form_fill_router import new_trace_id, _tlog
@@ -1870,13 +1871,19 @@ async def stream_agent_loop(
             from src.form_fill_router import (
                 maybe_route_pending_browser_fill,
                 maybe_route_initial_preview,
+                has_pending_safe_fill,
                 new_trace_id,
                 _tlog,
             )
+            # Captured BEFORE the routers run: an executed approval consumes
+            # the pending entry, but the reporting turn must still keep
+            # browser tools pinned (see relevance block below).
+            _had_pending_fill = has_pending_safe_fill(session_id=session_id, owner=owner)
             _fill_trace = new_trace_id()
             _tlog(
                 _fill_trace, "turn_start",
                 message_len=len(_last_user or ""), session=session_id,
+                pending_fill=_had_pending_fill,
             )
             _routed_fill = await maybe_route_pending_browser_fill(
                 _last_user, session_id=session_id, owner=owner, trace=_fill_trace
@@ -1915,9 +1922,11 @@ async def stream_agent_loop(
                 {
                     k: _fill_result.get(k)
                     for k in (
-                        "output", "error", "succeeded_count", "failed_count",
-                        "unknown_count", "skipped", "blocked_actions", "page_url",
-                        "suggestion",
+                        "output", "error", "lifecycle", "failure_category",
+                        "succeeded_count", "failed_count", "unknown_count",
+                        "skipped_count", "blocked_count", "skipped",
+                        "blocked_actions", "controlled_page", "keep_browser_open",
+                        "page_url", "suggestion",
                     )
                     if k in _fill_result
                 },
@@ -1930,10 +1939,16 @@ async def stream_agent_loop(
                     "Odysseus already executed browser_operator_safe_fill with "
                     "confirmed=true on the backend. Verified result:\n"
                     f"{_fill_summary}\n"
-                    "Report this exact result to the user. Do NOT call any browser "
-                    "or fill tools again for this batch, and do NOT ask for approval "
-                    "again. Password, upload and submit/apply controls were not "
-                    "touched and remain blocked."
+                    "Report this to the user in this compact style, nothing more:\n"
+                    "Filled: <succeeded_count> safe fields verified\n"
+                    "Skipped/Blocked: <short list of skipped and blocked controls>\n"
+                    "Controlled page: <url> (<title>), headed=<true|false>\n"
+                    "Browser: left open (or managed by browser MCP)\n"
+                    "If lifecycle is not 'completed', lead with the failure_category "
+                    "and one next useful step instead of any success language. "
+                    "Do NOT call any browser or fill tools again for this batch, and "
+                    "do NOT ask for approval again. Password, upload and submit/apply "
+                    "controls were not touched and remain blocked."
                 ),
             })
         elif _routed_fill.get("status") == "expired":
@@ -2017,11 +2032,15 @@ async def stream_agent_loop(
     if not (plan_mode or guide_only):
         try:
             from src.form_fill_router import has_pending_safe_fill
-            if has_pending_safe_fill(session_id=session_id, owner=owner):
+            if (
+                _had_pending_fill
+                or _routed_fill is not None
+                or has_pending_safe_fill(session_id=session_id, owner=owner)
+            ):
                 _intent["domains"] = set(_intent.get("domains") or set()) | {"browser"}
                 logger.info(
-                    "[fill-router] pending safe fill for this scope; forcing "
-                    "browser tool relevance for this turn"
+                    "[fill-router] pending/just-executed safe fill for this scope; "
+                    "forcing browser tool relevance for this turn"
                 )
         except Exception:
             logger.exception("[fill-router] pending relevance check failed")

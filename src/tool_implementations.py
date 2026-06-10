@@ -4726,6 +4726,10 @@ async def do_browser_operator_safe_fill(
         keep_browser_open = keep_browser_open.strip().lower() not in ("0", "false", "no", "off")
     else:
         keep_browser_open = bool(keep_browser_open)
+    try:
+        max_fields_per_batch = int(args.get("max_fields_per_batch", 25) or 25)
+    except (TypeError, ValueError):
+        max_fields_per_batch = 25
     trace = args.get("_trace")
 
     if not page_url:
@@ -4802,6 +4806,7 @@ async def do_browser_operator_safe_fill(
 
         preview = {
             "pending_confirmation": True,
+            "lifecycle": "awaiting_approval",
             "tool_name": tool_name,
             "action_name": "safe_fill",
             "page_url": page_url,
@@ -4915,6 +4920,8 @@ async def do_browser_operator_safe_fill(
     if not mcp:
         return {
             "error": "Browser fill backend unavailable",
+            "failure_category": "browser_backend_unavailable",
+            "lifecycle": "failed_with_reason",
             "diagnostic": {
                 "browser_snapshot_available": False,
                 "browser_fill_tool_available": False,
@@ -4957,6 +4964,8 @@ async def do_browser_operator_safe_fill(
 
         return {
             "error": "Browser fill backend unavailable",
+            "failure_category": "browser_backend_unavailable",
+            "lifecycle": "failed_with_reason",
             "diagnostic": {
                 "browser_snapshot_available": snapshot_available,
                 "browser_fill_tool_available": fill_tool_available,
@@ -4984,6 +4993,7 @@ async def do_browser_operator_safe_fill(
             visible_mode=visible_mode,
             visible_fill_delay_ms=visible_fill_delay_ms,
             keep_browser_open=keep_browser_open,
+            max_fields_per_batch=max_fields_per_batch,
         )
     except Exception as exc:
         logger.warning("[browser_operator_safe_fill] Live fill execution failed: %s", exc)

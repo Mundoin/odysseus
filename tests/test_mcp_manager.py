@@ -34,7 +34,9 @@ def test_builtin_browser_mcp_headless_env_keeps_hidden_mode(monkeypatch):
     monkeypatch.setenv("ODYSSEUS_BROWSER_HEADLESS", "1")
     args = _browser_mcp_args()
 
-    assert args == ["-y", "@playwright/mcp@latest", "--headless", "--caps", "vision"]
+    assert args[:2] == ["-y", "@playwright/mcp@latest"]
+    assert "--headless" in args
+    assert "--caps" in args and args[args.index("--caps") + 1] == "vision"
 
 
 def test_generic_mcp_connection_error_preserves_original_error():

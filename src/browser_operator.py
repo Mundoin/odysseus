@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import re
+import uuid
 from typing import Any
 
 
@@ -1427,6 +1428,62 @@ def _tool_call_failed(result: Any) -> str | None:
     return None
 
 
+# Canonical form-fill lifecycle states, logged and reported so every model
+# sees the same workflow: requested → page_opened → inventory_captured →
+# preview_ready → awaiting_approval → approval_received → executing →
+# verifying → completed | partial_completed | failed_with_reason | resumed.
+FILL_LIFECYCLE_STATES = (
+    "requested", "page_opened", "inventory_captured", "preview_ready",
+    "awaiting_approval", "approval_received", "executing", "verifying",
+    "completed", "partial_completed", "failed_with_reason", "resumed",
+)
+
+# Default ceiling per execution batch — the smoke form is the tiny case;
+# large forms get chunked instead of one unbounded dispatch loop.
+DEFAULT_MAX_FIELDS_PER_BATCH = 25
+
+
+def build_live_fill_plan(
+    targets: list[dict[str, Any]],
+    known_values: dict[str, Any],
+) -> dict[str, Any]:
+    """Match snapshot targets to provided values. Pure planning, no execution.
+
+    Returns {"planned": [{"target", "key", "field_id"}], "skipped": [...],
+    "blocked": [...]} with stable field ids (snapshot refs), so large forms
+    can be planned, chunked and resumed without touching the browser."""
+    planned: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    blocked: list[dict[str, Any]] = []
+    used_keys: set[str] = set()
+    for target in targets:
+        field = {"label": target["label"], "name": "", "id": "", "type": target["role"]}
+        sensitive, why = _is_sensitive_form_field(field)
+        if sensitive:
+            blocked.append({"label": target["label"], "field_id": target["ref"], "reason": why})
+            continue
+        key = _known_value_key_for_field(field)
+        if not key or key in used_keys or key not in known_values or known_values.get(key) in (None, ""):
+            skipped.append({
+                "label": target["label"],
+                "field_id": target["ref"],
+                "reason": "no provided value matches this field",
+            })
+            continue
+        used_keys.add(key)
+        planned.append({"target": target, "key": key, "field_id": target["ref"]})
+    return {"planned": planned, "skipped": skipped, "blocked": blocked}
+
+
+def chunk_fill_plan(
+    planned: list[dict[str, Any]],
+    max_per_batch: int = DEFAULT_MAX_FIELDS_PER_BATCH,
+) -> list[list[dict[str, Any]]]:
+    """Chunk a fill plan into execution batches for large forms."""
+    size = max(1, int(max_per_batch or 1))
+    return [planned[i:i + size] for i in range(0, len(planned), size)]
+
+
 async def execute_live_safe_fill(
     mcp: Any,
     page_url: str,
@@ -1436,6 +1493,7 @@ async def execute_live_safe_fill(
     visible_mode: bool = False,
     visible_fill_delay_ms: int = 0,
     keep_browser_open: bool = True,
+    max_fields_per_batch: int = DEFAULT_MAX_FIELDS_PER_BATCH,
 ) -> dict[str, Any]:
     """Navigate to ``page_url``, resolve field refs from a live snapshot and
     type only safe, value-matched text fields. Verification is based on the
@@ -1444,6 +1502,19 @@ async def execute_live_safe_fill(
     def _t(phase: str, **fields: Any) -> None:
         extra = " ".join(f"{k}={v}" for k, v in fields.items())
         logger.info("[form-fill-router] trace=%s phase=%s %s", trace or "-", phase, extra)
+
+    fill_run_id = f"fill-run:{uuid.uuid4().hex[:12]}"
+
+    def _failure(category: str, payload: dict[str, Any]) -> dict[str, Any]:
+        _t("lifecycle", state="failed_with_reason", category=category, run=fill_run_id)
+        return {
+            **payload,
+            "lifecycle": "failed_with_reason",
+            "failure_category": category,
+            "fill_run_id": fill_run_id,
+        }
+
+    _t("lifecycle", state="executing", run=fill_run_id)
 
     nav_tool = _discover_browser_tool(
         mcp, ("browser_navigate",),
@@ -1471,13 +1542,14 @@ async def execute_live_safe_fill(
     nav_error = _tool_call_failed(nav_result)
     if nav_error:
         _t("live_fill_navigate", result="failed", reason="navigate_failed")
-        return {
+        return _failure("navigation_failed", {
             "error": f"Browser navigation to {page_url} failed: {nav_error}",
             "diagnostic": {"navigate_tool": nav_tool, "navigate_error": nav_error},
             "visible_mode": visible_mode,
             "browser_session_status": "navigation_failed",
             "exit_code": 1,
-        }
+        })
+    _t("lifecycle", state="page_opened", run=fill_run_id)
     if delay_seconds:
         await asyncio.sleep(delay_seconds)
 
@@ -1493,13 +1565,13 @@ async def execute_live_safe_fill(
     snapshot_result = await mcp.call_tool(snapshot_tool, {})
     snap_error = _tool_call_failed(snapshot_result)
     if snap_error:
-        return {
+        return _failure("snapshot_failed", {
             "error": f"Browser snapshot failed after navigation: {snap_error}",
             "diagnostic": {"snapshot_tool": snapshot_tool, "snapshot_error": snap_error},
             "visible_mode": visible_mode,
             "browser_session_status": "snapshot_failed",
             "exit_code": 1,
-        }
+        })
     if not controlled_page:
         controlled_page = _page_identity_from_text(_mcp_result_text(snapshot_result))
     _t(
@@ -1512,70 +1584,65 @@ async def execute_live_safe_fill(
 
     targets = parse_snapshot_fill_targets(snapshot_result)
     _t("live_fill_targets", count=len(targets), labels=repr([t["label"] for t in targets][:12]))
+    _t("lifecycle", state="inventory_captured", run=fill_run_id, targets=len(targets))
     if not targets:
-        return {
+        return _failure("zero_targets_found", {
             "error": "No fillable fields found in the live page snapshot",
             "diagnostic": {
                 "page_url": page_url,
                 "snapshot_tool": snapshot_tool,
+                "controlled_page": controlled_page,
                 "reason": "snapshot contained no textbox/searchbox/combobox refs",
             },
             "visible_mode": visible_mode,
             "browser_session_status": "open_after_navigation" if keep_browser_open else "managed_by_browser_mcp",
             "exit_code": 1,
-        }
+        })
 
-    plan: list[tuple[dict[str, Any], str]] = []
-    skipped: list[dict[str, Any]] = []
-    blocked: list[dict[str, Any]] = []
-    used_keys: set[str] = set()
-    for target in targets:
-        field = {"label": target["label"], "name": "", "id": "", "type": target["role"]}
-        sensitive, why = _is_sensitive_form_field(field)
-        if sensitive:
-            blocked.append({"label": target["label"], "reason": why})
-            _t("live_fill_skip", label=repr(target["label"]), reason="sensitive_field")
-            continue
-        key = _known_value_key_for_field(field)
-        if not key or key in used_keys or key not in known_values or known_values.get(key) in (None, ""):
-            skipped.append({
-                "label": target["label"],
-                "reason": "no provided value matches this field",
-            })
-            _t("live_fill_skip", label=repr(target["label"]), reason="no_matching_value")
-            continue
-        used_keys.add(key)
-        plan.append((target, key))
+    plan_info = build_live_fill_plan(targets, known_values)
+    skipped = plan_info["skipped"]
+    blocked = plan_info["blocked"]
+    for item in blocked:
+        _t("live_fill_skip", label=repr(item["label"]), reason="sensitive_field")
+    for item in skipped:
+        _t("live_fill_skip", label=repr(item["label"]), reason="no_matching_value")
+    batches = chunk_fill_plan(plan_info["planned"], max_per_batch=max_fields_per_batch)
+    planned_count = len(plan_info["planned"])
 
     succeeded = 0
     failed = 0
     unknown = 0
     filled: list[dict[str, Any]] = []
-    for target, key in plan:
-        # @playwright/mcp browser_type takes `target` (a snapshot ref) + `text`.
-        args = {"target": target["ref"], "text": str(known_values[key])}
-        _t("live_fill_dispatch", tool=type_tool, label=repr(target["label"]), ref=target["ref"], value_key=key)
-        if delay_seconds:
-            await asyncio.sleep(delay_seconds)
-        result = await mcp.call_tool(type_tool, args)
-        if delay_seconds:
-            await asyncio.sleep(delay_seconds)
-        error = _tool_call_failed(result)
-        filled.append({
-            "field_ref": target["ref"],
-            "label": target["label"],
-            "value_source": f"known_values.{key}",
-            "status": "failed" if error else "dispatched",
-            **({"reason": error} if error else {}),
-        })
-        if error:
-            failed += 1
-            _t(
-                "live_fill_result",
-                label=repr(target["label"]), status="failed",
-                reason=repr(redact_sensitive_text(error)[:200]),
-            )
+    for batch_index, batch in enumerate(batches):
+        if len(batches) > 1:
+            _t("live_fill_batch", index=batch_index + 1, total=len(batches), size=len(batch))
+        for item in batch:
+            target, key = item["target"], item["key"]
+            # @playwright/mcp browser_type takes `target` (a snapshot ref) + `text`.
+            args = {"target": target["ref"], "text": str(known_values[key])}
+            _t("live_fill_dispatch", tool=type_tool, label=repr(target["label"]), ref=target["ref"], value_key=key)
+            if delay_seconds:
+                await asyncio.sleep(delay_seconds)
+            result = await mcp.call_tool(type_tool, args)
+            if delay_seconds:
+                await asyncio.sleep(delay_seconds)
+            error = _tool_call_failed(result)
+            filled.append({
+                "field_ref": target["ref"],
+                "label": target["label"],
+                "value_source": f"known_values.{key}",
+                "status": "failed" if error else "dispatched",
+                **({"reason": error} if error else {}),
+            })
+            if error:
+                failed += 1
+                _t(
+                    "live_fill_result",
+                    label=repr(target["label"]), status="failed",
+                    reason=repr(redact_sensitive_text(error)[:200]),
+                )
 
+    _t("lifecycle", state="verifying", run=fill_run_id)
     verify_result = await mcp.call_tool(snapshot_tool, {})
     verify_text = _mcp_result_text(verify_result)
     for entry in filled:
@@ -1602,6 +1669,21 @@ async def execute_live_safe_fill(
         browser_session_status="open_after_fill" if keep_browser_open else "managed_by_browser_mcp",
     )
 
+    # Honest outcome: "completed" is reserved for full post-fill verification.
+    if planned_count == 0:
+        lifecycle, failure_category = "failed_with_reason", "zero_fields_planned"
+        outcome_phrase = "planned nothing — no provided value matched any field"
+    elif succeeded == 0:
+        lifecycle, failure_category = "failed_with_reason", "zero_fields_verified"
+        outcome_phrase = "FAILED verification — no field visibly changed"
+    elif succeeded < planned_count:
+        lifecycle, failure_category = "partial_completed", "partially_verified"
+        outcome_phrase = "partially completed"
+    else:
+        lifecycle, failure_category = "completed", None
+        outcome_phrase = "completed"
+    _t("lifecycle", state=lifecycle, run=fill_run_id, category=failure_category or "-")
+
     zero_fill_diagnosis = ""
     if succeeded == 0:
         # Exact per-field reasons so a "completed but empty form" report is
@@ -1624,6 +1706,11 @@ async def execute_live_safe_fill(
     if headed is not None:
         controlled_page_report["headed"] = headed
     controlled_page_report["fill_tool"] = type_tool
+    try:
+        from src.builtin_mcp import browser_mcp_launch_info
+        controlled_page_report["launch"] = browser_mcp_launch_info()
+    except Exception:
+        logger.debug("browser launch info unavailable", exc_info=True)
     page_proof = (
         f" Controlled page: {controlled_page.get('url') or 'unknown'}"
         + (f" ({controlled_page['title']!r})" if controlled_page.get("title") else "")
@@ -1658,26 +1745,35 @@ async def execute_live_safe_fill(
         "browser_session_status": "open_after_fill" if keep_browser_open else "managed_by_browser_mcp",
         "controlled_page": controlled_page_report,
     }
-    return {
+    result = {
         "output": (
-            f"{result_summary['label']} completed. {succeeded} fields filled and verified, "
+            f"{result_summary['label']} {outcome_phrase}. {succeeded} fields filled and verified, "
             f"{failed} failed, {unknown} could not be verified. "
             f"{len(skipped)} skipped, {len(blocked)} blocked. "
             f"Browser/session status: {result_summary['browser_session_status']}."
             + page_proof
             + zero_fill_diagnosis
         ),
+        "lifecycle": lifecycle,
+        "fill_run_id": fill_run_id,
         "controlled_page": controlled_page_report,
         "operator_visible_summary": result_summary,
         "visible_mode": visible_mode,
         "visible_fill_delay_ms": int(visible_fill_delay_ms or 0),
         "keep_browser_open": keep_browser_open,
         "browser_session_status": result_summary["browser_session_status"],
+        "planned_count": planned_count,
+        "targets_count": len(targets),
         "succeeded_count": succeeded,
         "failed_count": failed,
         "unknown_count": unknown,
         "skipped_count": len(skipped),
         "blocked_count": len(blocked),
+        "verified_fields": [
+            entry["field_ref"] for entry in filled if entry.get("status") == "succeeded"
+        ],
+        "max_fields_per_batch": max(1, int(max_fields_per_batch or 1)),
+        "batches_count": len(batches),
         "filled": filled,
         "skipped": skipped,
         "blocked_actions": blocked,
@@ -1685,5 +1781,12 @@ async def execute_live_safe_fill(
         "fill_tool_name": type_tool,
         "snapshot_tool_name": snapshot_tool,
         "raw_value_policy": "Raw values were used only for immediate browser fill dispatch and are not persisted in this output.",
-        "exit_code": 0,
+        "exit_code": 0 if lifecycle in ("completed", "partial_completed") else 1,
     }
+    if failure_category:
+        result["failure_category"] = failure_category
+        if lifecycle == "failed_with_reason":
+            result["error"] = (
+                f"{result_summary['label']} {outcome_phrase}." + zero_fill_diagnosis
+            )
+    return result

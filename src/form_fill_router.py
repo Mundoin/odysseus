@@ -49,10 +49,10 @@ _MAX_APPROVAL_LENGTH = 80
 
 _APPROVAL_RE = re.compile(
     r"^(?:yes|yep|yeah|y|ok|okay|sure|approved?|confirm(?:ed)?|proceed|go|"
-    r"go ahead|do it|fill(?: it| them| the form)?(?: in)?|run it|execute|"
+    r"go ahead|do it|continue|fill(?: it| them| the form)?(?: in)?|run it|execute|"
     r"please do|sounds good|looks good|lgtm)"
-    r"(?:[\s,]+(?:please|yes|ok|okay|sure|go ahead|do it|proceed|"
-    r"fill(?: it| them| the form)?(?: in)?|fill|it|in|them|the form|now|then))*$"
+    r"(?:[\s,]+(?:please|yes|ok|okay|sure|go ahead|do it|proceed|continue|"
+    r"approved?|fill(?: it| them| the form)?(?: in)?|fill|it|in|them|the form|now|then))*$"
 )
 
 # Natural approval sentences that don't fit the strict token chain above:

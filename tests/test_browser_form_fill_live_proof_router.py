@@ -495,6 +495,141 @@ def test_live_fill_zero_success_output_names_per_field_reasons():
     )
 
 
+# ── Flow hardening: lifecycle, honest outcomes, chunking, approval phrases ──
+
+
+APPROVAL_PHRASES = [
+    "approved",
+    "Approved.",
+    "yes",
+    "yes approve",
+    "yes approved",
+    "fill now",
+    "proceed",
+    "go ahead",
+    "continue",
+    "execute fill",
+    "looks good",
+    "okay fill it",
+]
+
+
+@pytest.mark.parametrize("phrase", APPROVAL_PHRASES)
+def test_supported_approval_phrases_classify_as_approval(phrase):
+    hit, reason = router.approval_check(phrase)
+    assert hit is True, f"{phrase!r} -> {reason}"
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "approved, also click submit",
+        "yes, and upload the cv",
+        "fill it and send the application",
+        "go ahead and enter the password too",
+    ],
+)
+def test_high_impact_phrases_never_route_as_plain_approval(phrase):
+    hit, reason = router.approval_check(phrase)
+    assert hit is False
+    assert reason == "high_impact_word"
+
+
+def test_zero_verified_fields_is_failure_not_success():
+    from src.browser_operator import execute_live_safe_fill
+
+    mcp = _FakeMCP(verify_text="")  # nothing verifiable post-fill
+    report = asyncio.run(execute_live_safe_fill(mcp, PAGE_URL_LIVE, EXPECTED_VALUES))
+
+    assert report["lifecycle"] == "failed_with_reason"
+    assert report["failure_category"] == "zero_fields_verified"
+    assert report["exit_code"] == 1
+    assert report["error"]
+    assert "completed" not in report["output"]
+
+
+def test_full_verification_reports_completed_lifecycle_and_run_id():
+    from src.browser_operator import execute_live_safe_fill
+
+    verify = "\n".join(f"- text: {v}" for v in EXPECTED_VALUES.values())
+    report = asyncio.run(
+        execute_live_safe_fill(_FakeMCP(verify_text=verify), PAGE_URL_LIVE, EXPECTED_VALUES)
+    )
+
+    assert report["lifecycle"] == "completed"
+    assert "failure_category" not in report
+    assert report["fill_run_id"].startswith("fill-run:")
+    assert report["planned_count"] == 7
+    assert len(report["verified_fields"]) == 7
+    assert report["batches_count"] == 1
+    assert report["keep_browser_open"] is True
+
+
+def test_large_form_plan_chunks_without_execution():
+    from src.browser_operator import build_live_fill_plan, chunk_fill_plan
+
+    # 60 first/last-name-alias textboxes can't all map (dedup by key), so use
+    # synthetic unique aliases via email/phone/etc cycling — simpler: 60
+    # cover-letter-style targets where only one maps, plus generic unmatched.
+    targets = [
+        {"role": "textbox", "label": f"Custom field {i}", "ref": f"e{i}"}
+        for i in range(60)
+    ]
+    targets += [
+        {"role": "textbox", "label": "First name", "ref": "f1"},
+        {"role": "textbox", "label": "Last name", "ref": "f2"},
+        {"role": "textbox", "label": "Email", "ref": "f3"},
+        {"role": "textbox", "label": "Password", "ref": "f4"},
+    ]
+    plan = build_live_fill_plan(targets, EXPECTED_VALUES)
+
+    assert {p["field_id"] for p in plan["planned"]} == {"f1", "f2", "f3"}
+    assert len(plan["skipped"]) == 60
+    assert len(plan["blocked"]) == 1
+    assert all(item["field_id"] for item in plan["skipped"])
+
+    chunks = chunk_fill_plan(plan["planned"], max_per_batch=2)
+    assert [len(c) for c in chunks] == [2, 1]
+    chunks_default = chunk_fill_plan(list(range(60)), max_per_batch=25)
+    assert [len(c) for c in chunks_default] == [25, 25, 10]
+
+
+def test_browser_launch_info_env_configuration(monkeypatch):
+    from src.builtin_mcp import browser_mcp_launch_info, _browser_mcp_args
+
+    for var in (
+        "ODYSSEUS_BROWSER_HEADLESS", "ODYSSEUS_BROWSER_EXECUTABLE",
+        "ODYSSEUS_BROWSER_CHANNEL", "ODYSSEUS_BROWSER_USER_DATA_DIR",
+        "ODYSSEUS_BROWSER_NO_SANDBOX",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+    # Default: headed, no sandbox flag, no custom binary.
+    info = browser_mcp_launch_info()
+    assert info["headless"] is False and info["no_sandbox"] is False
+    args = _browser_mcp_args()
+    assert "--headless" not in args and "--no-sandbox" not in args
+
+    monkeypatch.setenv("ODYSSEUS_BROWSER_HEADLESS", "1")
+    monkeypatch.setenv("ODYSSEUS_BROWSER_EXECUTABLE", r"C:\Thorium\thorium.exe")
+    monkeypatch.setenv("ODYSSEUS_BROWSER_NO_SANDBOX", "1")
+    args = _browser_mcp_args()
+    assert "--headless" in args
+    assert "--no-sandbox" in args
+    assert args[args.index("--executable-path") + 1] == r"C:\Thorium\thorium.exe"
+
+
+def test_live_fill_result_reports_launch_mode():
+    from src.browser_operator import execute_live_safe_fill
+
+    verify = "\n".join(f"- text: {v}" for v in EXPECTED_VALUES.values())
+    report = asyncio.run(
+        execute_live_safe_fill(_FakeMCP(verify_text=verify), PAGE_URL_LIVE, EXPECTED_VALUES)
+    )
+    launch = report["controlled_page"]["launch"]
+    assert set(launch) == {"headless", "executable", "channel", "user_data_dir", "no_sandbox"}
+
+
 # ── Natural approval phrases (hf1) ───────────────────────────────────────────
 
 

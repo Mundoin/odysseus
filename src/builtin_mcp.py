@@ -88,6 +88,27 @@ def browser_mcp_headless() -> bool:
     return _env_truthy("ODYSSEUS_BROWSER_HEADLESS", default=False)
 
 
+def browser_mcp_launch_info() -> dict:
+    """Resolved launch configuration for the built-in browser MCP.
+
+    Env-driven so browser identity is explicit and configurable:
+      ODYSSEUS_BROWSER_HEADLESS=1       headless mode (default: headed/visible)
+      ODYSSEUS_BROWSER_EXECUTABLE=path  custom browser binary (Chrome/Thorium/...)
+      ODYSSEUS_BROWSER_CHANNEL=name     playwright channel (chrome, msedge, ...)
+      ODYSSEUS_BROWSER_USER_DATA_DIR=p  persistent profile directory
+      ODYSSEUS_BROWSER_NO_SANDBOX=1     pass --no-sandbox (off by default; only
+                                        set when the local Chromium refuses to
+                                        start without it)
+    """
+    return {
+        "headless": _env_truthy("ODYSSEUS_BROWSER_HEADLESS", default=False),
+        "executable": os.environ.get("ODYSSEUS_BROWSER_EXECUTABLE", "").strip(),
+        "channel": os.environ.get("ODYSSEUS_BROWSER_CHANNEL", "").strip(),
+        "user_data_dir": os.environ.get("ODYSSEUS_BROWSER_USER_DATA_DIR", "").strip(),
+        "no_sandbox": _env_truthy("ODYSSEUS_BROWSER_NO_SANDBOX", default=False),
+    }
+
+
 def _browser_mcp_args() -> list[str]:
     """Built-in Browser MCP launch args.
 
@@ -95,9 +116,18 @@ def _browser_mcp_args() -> list[str]:
     watch approved fills happen. Set ODYSSEUS_BROWSER_HEADLESS=1 to restore the
     older hidden/backend proof mode.
     """
+    info = browser_mcp_launch_info()
     args = ["-y", "@playwright/mcp@latest", "--caps", "vision"]
-    if _env_truthy("ODYSSEUS_BROWSER_HEADLESS", default=False):
-        args.insert(2, "--headless")
+    if info["headless"]:
+        args.append("--headless")
+    if info["executable"]:
+        args.extend(["--executable-path", info["executable"]])
+    if info["channel"]:
+        args.extend(["--browser", info["channel"]])
+    if info["user_data_dir"]:
+        args.extend(["--user-data-dir", info["user_data_dir"]])
+    if info["no_sandbox"]:
+        args.append("--no-sandbox")
     return args
 
 
