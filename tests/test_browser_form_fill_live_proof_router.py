@@ -339,7 +339,7 @@ def test_live_fill_navigates_types_safe_fields_and_verifies():
     assert nav_calls == [("mcp__builtin_browser__browser_navigate", {"url": PAGE_URL_LIVE})]
     type_calls = [c for c in mcp.calls if c[0].endswith("browser_type")]
     assert len(type_calls) == 7
-    typed_refs = {c[1]["ref"] for c in type_calls}
+    typed_refs = {c[1]["target"] for c in type_calls}
     assert "e17" not in typed_refs  # password textbox never typed
     assert report["succeeded_count"] == 7
     assert report["failed_count"] == 0

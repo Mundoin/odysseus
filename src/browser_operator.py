@@ -1493,7 +1493,8 @@ async def execute_live_safe_fill(
     unknown = 0
     filled: list[dict[str, Any]] = []
     for target, key in plan:
-        args = {"element": target["label"], "ref": target["ref"], "text": str(known_values[key])}
+        # @playwright/mcp browser_type takes `target` (a snapshot ref) + `text`.
+        args = {"target": target["ref"], "text": str(known_values[key])}
         _t("live_fill_dispatch", tool=type_tool, label=repr(target["label"]), ref=target["ref"], value_key=key)
         result = await mcp.call_tool(type_tool, args)
         error = _tool_call_failed(result)
@@ -1506,7 +1507,11 @@ async def execute_live_safe_fill(
         })
         if error:
             failed += 1
-            _t("live_fill_result", label=repr(target["label"]), status="failed")
+            _t(
+                "live_fill_result",
+                label=repr(target["label"]), status="failed",
+                reason=repr(redact_sensitive_text(error)[:200]),
+            )
 
     verify_result = await mcp.call_tool(snapshot_tool, {})
     verify_text = _mcp_result_text(verify_result)
