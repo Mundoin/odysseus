@@ -1854,15 +1854,41 @@ async def stream_agent_loop(
     # cannot stall or narrate its way out of an approved fill; it only gets
     # the backend result to report. Plan mode and guide-only never execute.
     _routed_fill = None
-    if not plan_mode and not guide_only:
+    _routed_preview = None
+    if plan_mode or guide_only:
         try:
-            from src.form_fill_router import maybe_route_pending_browser_fill
-            _routed_fill = await maybe_route_pending_browser_fill(
-                _last_user, session_id=session_id, owner=owner
+            from src.form_fill_router import new_trace_id, _tlog
+            _tlog(
+                new_trace_id(), "approval_check",
+                result="miss",
+                reason="plan_mode" if plan_mode else "guide_only",
             )
+        except Exception:
+            logger.debug("[fill-router] telemetry import failed", exc_info=True)
+    else:
+        try:
+            from src.form_fill_router import (
+                maybe_route_pending_browser_fill,
+                maybe_route_initial_preview,
+                new_trace_id,
+                _tlog,
+            )
+            _fill_trace = new_trace_id()
+            _tlog(
+                _fill_trace, "turn_start",
+                message_len=len(_last_user or ""), session=session_id,
+            )
+            _routed_fill = await maybe_route_pending_browser_fill(
+                _last_user, session_id=session_id, owner=owner, trace=_fill_trace
+            )
+            if not _routed_fill:
+                _routed_preview = await maybe_route_initial_preview(
+                    _last_user, session_id=session_id, owner=owner, trace=_fill_trace
+                )
         except Exception:
             logger.exception("[fill-router] router failed; using normal agent flow")
             _routed_fill = None
+            _routed_preview = None
     if _routed_fill:
         messages = list(messages)
         if _routed_fill.get("status") == "executed":
@@ -1919,6 +1945,64 @@ async def stream_agent_loop(
                     "[odysseus-backend] The pending safe form fill approval expired and "
                     "was cleared. Nothing was filled. Tell the user, and offer to "
                     f"regenerate the preview. Diagnostic: {_exp_msg}"
+                ),
+            })
+
+    # ── Deterministic initial preview router (browser safe fill) ───────────
+    # A user message carrying URL + key:value fill values + fill intent gets
+    # its preview/pending action created backend-side here — before the model
+    # can narrate tool usage instead of calling the tool.
+    if _routed_preview and _routed_preview.get("status") == "preview":
+        messages = list(messages)
+        _prev_result = _routed_preview.get("result") or {}
+        _prev_cmd = f"preview-router safe fill preview: {_routed_preview.get('page_url', '')}"
+        yield 'data: ' + json.dumps({
+            "type": "tool_start",
+            "tool": "browser_operator_safe_fill",
+            "command": _prev_cmd,
+        }) + '\n\n'
+        if _prev_result.get("pending_confirmation"):
+            _prev_output = format_confirmation_preview(_prev_result)[:4000]
+        else:
+            _prev_output = (
+                _prev_result.get("output")
+                or _prev_result.get("error")
+                or json.dumps(_prev_result, default=str)[:2000]
+            )
+        _prev_event = {
+            "type": "tool_output",
+            "tool": "browser_operator_safe_fill",
+            "command": _prev_cmd,
+            "output": _prev_output,
+            "exit_code": _prev_result.get("exit_code"),
+        }
+        if _prev_result.get("pending_confirmation"):
+            _prev_event["confirmation_preview"] = confirmation_preview_for_event(_prev_result)
+        yield 'data: ' + json.dumps(_prev_event) + '\n\n'
+        if _prev_result.get("pending_confirmation"):
+            messages.append({
+                "role": "user",
+                "content": (
+                    "[odysseus-backend] Odysseus already called "
+                    "browser_operator_safe_fill with confirmed=false for this "
+                    "request and recorded a pending safe-fill action. Preview:\n"
+                    f"{_prev_output}\n"
+                    "Present this preview to the user and ask for explicit "
+                    "approval to fill the safe fields. Do NOT call "
+                    "browser_operator_safe_fill or any fill tool yourself — on "
+                    "approval the backend executes it. Password, upload and "
+                    "submit/apply stay blocked."
+                ),
+            })
+        else:
+            messages.append({
+                "role": "user",
+                "content": (
+                    "[odysseus-backend] Odysseus tried to create the safe form "
+                    "fill preview backend-side but got this result:\n"
+                    f"{_prev_output}\n"
+                    "Report this exact diagnostic to the user. Do not claim the "
+                    "fill succeeded."
                 ),
             })
 

@@ -1,34 +1,42 @@
-"""Deterministic approval router for pending browser safe-fill actions.
+"""Deterministic routers for browser safe-fill: initial preview + approval.
 
-Stage: odysseus-browser-form-fill-autopilot-router-v1
+Stage: odysseus-browser-form-fill-live-proof-router-diagnostics-v1
+(supersedes odysseus-browser-form-fill-autopilot-router-v1)
 
-Problem this solves: after `browser_operator_safe_fill` returns a
-pending_confirmation preview, execution used to depend on the model emitting
-the confirmed tool call. Several models (Mimo family) narrate "I will call
-browser_operator_safe_fill" instead of calling it, stalling the loop.
+Two model-independent routing points, both running BEFORE model tool choice:
 
-Fix: the backend owns the execution switch. When a pending safe-fill request
-exists for the current chat scope and the user's next message is an
-approval, the agent loop calls `maybe_route_pending_browser_fill()` BEFORE
-any model tool choice and executes `browser_operator_safe_fill` with
-``confirmed=true`` directly.
+1. Initial preview router — a user message carrying a URL, key:value fill
+   values and explicit fill intent triggers a backend call to
+   `browser_operator_safe_fill` with ``confirmed=false``. The preview and
+   pending action exist before the model can narrate tool usage.
+
+2. Approval router — a pending safe-fill plus a short approval message
+   triggers backend execution with ``confirmed=true``.
+
+Every decision emits structured telemetry:
+    [form-fill-router] trace=<id> phase=<phase> key=value ...
+so live server logs prove exactly which layer fired or missed.
 
 Scope limits (hard):
-- Routes safe text-field fill ONLY. Password / upload / submit / apply /
-  payment / send / delete intents are never routed; those words in the
-  approval message disqualify routing entirely.
+- Safe text-field fill ONLY. Password / upload / submit / apply / payment /
+  send / delete intents are never routed; high-impact words in an approval
+  disqualify routing entirely (reason=high_impact_word).
 - Pending state is in-memory and ephemeral (TTL), never persisted.
+- Telemetry is redacted: field counts and key names only, never raw values.
 """
 
 import json
 import logging
 import re
 import time
-from typing import Any, Awaitable, Callable, Dict, Optional
+import uuid
+from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 
 from src.browser_operator import browser_action_scope
 
 logger = logging.getLogger("odysseus.form_fill_router")
+
+ROUTER_VERSION = "live-proof-router-diagnostics-v1"
 
 # How long an unapproved preview stays actionable.
 PENDING_SAFE_FILL_TTL_SECONDS = 15 * 60
@@ -55,6 +63,34 @@ _HIGH_IMPACT_RE = re.compile(
     r"order|password|login|log in|sign in|sign up|register|evaluate|script)\b"
 )
 
+_URL_RE = re.compile(r"https?://[^\s<>\"'\)\]]+")
+_FILL_INTENT_RE = re.compile(
+    r"(?i)\b(fill|form[- ]?fill|safe fields|provided values|enter (?:these|the) values)\b"
+)
+_KV_LINE_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_ ]{0,40}?)\s*:\s*(\S.*)$")
+
+# Keys never accepted as fill values, even if the user provides them inline.
+_SENSITIVE_KEY_RE = re.compile(
+    r"(?i)\b(password|passwd|pass|token|secret|api[_ ]?key|cvv|cvc|card|iban|"
+    r"ssn|tax|health|pin)\b"
+)
+# key:value parsing must not swallow prose lines ("Open this page in the
+# browser, then inspect it:") — keys are short identifiers, max 3 words.
+_MAX_KEY_WORDS = 3
+
+
+def new_trace_id() -> str:
+    return uuid.uuid4().hex[:8]
+
+
+def _tlog(trace: Optional[str], phase: str, **fields: Any) -> None:
+    extra = " ".join(f"{k}={v}" for k, v in fields.items())
+    logger.info("[form-fill-router] trace=%s phase=%s %s", trace or "-", phase, extra)
+
+
+def log_router_version() -> None:
+    logger.info("[form-fill-router] version=%s", ROUTER_VERSION)
+
 
 def record_pending_safe_fill(
     scope: str,
@@ -64,6 +100,7 @@ def record_pending_safe_fill(
     form_fill_plan: Optional[Dict[str, Any]] = None,
     batch_size: int = 3,
     ttl_seconds: float = PENDING_SAFE_FILL_TTL_SECONDS,
+    trace: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Remember the full safe-fill request so the backend can execute it on
     approval without any model involvement. Raw values stay in process
@@ -71,6 +108,7 @@ def record_pending_safe_fill(
     now = time.time()
     entry = {
         "kind": "browser_safe_fill",
+        "pending_id": f"safe-fill:{uuid.uuid4().hex[:12]}",
         "page_url": page_url,
         "known_values": dict(known_values),
         "form_fill_plan": form_fill_plan,
@@ -80,9 +118,10 @@ def record_pending_safe_fill(
         "status": "pending_approval",
     }
     _PENDING_SAFE_FILL[scope] = entry
-    logger.info(
-        "[fill-router] recorded pending safe fill scope=%s url=%s fields=%d",
-        scope, page_url, len(known_values),
+    _tlog(
+        trace, "pending_recorded",
+        pending_id=entry["pending_id"], scope=scope,
+        values_count=len(known_values), ttl_seconds=int(ttl_seconds),
     )
     return entry
 
@@ -91,11 +130,13 @@ def get_pending_safe_fill(scope: str) -> Optional[Dict[str, Any]]:
     return _PENDING_SAFE_FILL.get(scope)
 
 
-def clear_pending_safe_fill(scope: Optional[str] = None) -> None:
+def clear_pending_safe_fill(scope: Optional[str] = None, trace: Optional[str] = None) -> None:
     if scope is None:
         _PENDING_SAFE_FILL.clear()
-    else:
-        _PENDING_SAFE_FILL.pop(scope, None)
+        return
+    entry = _PENDING_SAFE_FILL.pop(scope, None)
+    if entry:
+        _tlog(trace, "pending_cleared", pending_id=entry.get("pending_id"), scope=scope)
 
 
 def _normalise(text: str) -> str:
@@ -104,14 +145,65 @@ def _normalise(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def approval_check(text: str) -> Tuple[bool, str]:
+    """Classify a message as approval. Returns (hit, reason)."""
+    raw = (text or "").strip()
+    if not raw:
+        return False, "empty_message"
+    if len(raw) > _MAX_APPROVAL_LENGTH:
+        return False, "too_long"
+    if _HIGH_IMPACT_RE.search(raw):
+        return False, "high_impact_word"
+    if not _APPROVAL_RE.match(_normalise(raw)):
+        return False, "not_approval"
+    return True, "approval"
+
+
 def is_approval_message(text: str) -> bool:
     """True only for short, pure approval messages with no high-impact ask."""
-    raw = (text or "").strip()
-    if not raw or len(raw) > _MAX_APPROVAL_LENGTH:
-        return False
-    if _HIGH_IMPACT_RE.search(raw):
-        return False
-    return bool(_APPROVAL_RE.match(_normalise(raw)))
+    return approval_check(text)[0]
+
+
+def parse_fill_request(message: str) -> Dict[str, Any]:
+    """Extract URL + key:value fill values + fill intent from a user message.
+
+    Returns {"hit": True, "page_url": ..., "known_values": {...}} or
+    {"hit": False, "reason": no_url|no_fill_values|no_fill_intent}.
+    """
+    text = message or ""
+    url_match = _URL_RE.search(text)
+    if not url_match:
+        return {"hit": False, "reason": "no_url"}
+    page_url = url_match.group(0).rstrip(".,;")
+
+    if not _FILL_INTENT_RE.search(text):
+        return {"hit": False, "reason": "no_fill_intent"}
+
+    known_values: Dict[str, str] = {}
+    skipped_sensitive = 0
+    for line in text.splitlines():
+        if "://" in line:
+            continue
+        m = _KV_LINE_RE.match(line)
+        if not m:
+            continue
+        key, value = m.group(1).strip(), m.group(2).strip()
+        if len(key.split()) > _MAX_KEY_WORDS:
+            continue
+        if _SENSITIVE_KEY_RE.search(key):
+            skipped_sensitive += 1
+            continue
+        known_values[key.lower().replace(" ", "_")] = value
+
+    if not known_values:
+        return {"hit": False, "reason": "no_fill_values"}
+
+    return {
+        "hit": True,
+        "page_url": page_url,
+        "known_values": known_values,
+        "skipped_sensitive_keys": skipped_sensitive,
+    }
 
 
 async def _default_execute(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -119,9 +211,86 @@ async def _default_execute(args: Dict[str, Any]) -> Dict[str, Any]:
 
     owner = args.pop("_owner", None)
     session_id = args.pop("_session_id", None)
+    args.pop("_trace", None)
     return await do_browser_operator_safe_fill(
         json.dumps(args), owner=owner, session_id=session_id
     )
+
+
+def _result_status(result: Dict[str, Any]) -> str:
+    if not isinstance(result, dict):
+        return "non_dict_result"
+    if result.get("error"):
+        if "unavailable" in str(result.get("error", "")).lower():
+            return "browser_backend_unavailable"
+        return "error"
+    if result.get("pending_confirmation"):
+        return "pending_confirmation"
+    return "ok"
+
+
+def _result_summary(result: Dict[str, Any]) -> str:
+    if not isinstance(result, dict):
+        return str(type(result).__name__)
+    text = result.get("output") or result.get("error") or result.get("message") or ""
+    return str(text)[:160].replace("\n", " ")
+
+
+async def maybe_route_initial_preview(
+    user_message: str,
+    *,
+    session_id: Optional[str] = None,
+    owner: Optional[str] = None,
+    execute: Optional[Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None,
+    trace: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Deterministic initial preview router. Runs BEFORE model tool choice.
+
+    A message with URL + key:value fill values + explicit fill intent gets a
+    backend `browser_operator_safe_fill confirmed=false` call immediately:
+    preview and pending action exist regardless of what the model narrates.
+
+    Returns None (no route) or {"status": "preview", "result": <preview>}.
+    """
+    parsed = parse_fill_request(user_message)
+    if not parsed.get("hit"):
+        _tlog(trace, "initial_preview_check", result="miss", reason=parsed.get("reason"))
+        return None
+
+    scope = browser_action_scope(session_id=session_id, owner=owner)
+    _tlog(
+        trace, "initial_preview_check",
+        result="hit", scope=scope, url_present=True,
+        values_count=len(parsed["known_values"]), fill_intent=True,
+    )
+    _tlog(
+        trace, "initial_preview_parse",
+        url_present=True, values_count=len(parsed["known_values"]),
+        fill_intent=True, skipped_sensitive_keys=parsed.get("skipped_sensitive_keys", 0),
+    )
+
+    args: Dict[str, Any] = {
+        "page_url": parsed["page_url"],
+        "known_values": parsed["known_values"],
+        "confirmed": False,
+        "_owner": owner,
+        "_session_id": session_id,
+        "_trace": trace,
+    }
+    runner = execute or _default_execute
+    _tlog(trace, "preview_call", tool="browser_operator_safe_fill", confirmed=False, called=True)
+    result = await runner(args)
+    status = _result_status(result)
+    _tlog(trace, "backend_result", status=status, summary=_result_summary(result))
+
+    return {
+        "status": "preview",
+        "scope": scope,
+        "page_url": parsed["page_url"],
+        "values_count": len(parsed["known_values"]),
+        "result": result,
+        "trace": trace,
+    }
 
 
 async def maybe_route_pending_browser_fill(
@@ -130,6 +299,7 @@ async def maybe_route_pending_browser_fill(
     session_id: Optional[str] = None,
     owner: Optional[str] = None,
     execute: Optional[Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None,
+    trace: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Deterministic approval router. Runs BEFORE model tool choice.
 
@@ -141,13 +311,25 @@ async def maybe_route_pending_browser_fill(
     scope = browser_action_scope(session_id=session_id, owner=owner)
     pending = _PENDING_SAFE_FILL.get(scope)
     if not pending or pending.get("kind") != "browser_safe_fill":
+        _tlog(trace, "approval_check", result="miss", reason="no_pending", scope=scope)
         return None
-    if not is_approval_message(user_message):
+
+    hit, reason = approval_check(user_message)
+    if not hit:
+        _tlog(
+            trace, "approval_check",
+            result="miss", reason=reason, scope=scope,
+            pending_id=pending.get("pending_id"),
+        )
         return None
 
     if time.time() > float(pending.get("expires_at", 0)):
-        clear_pending_safe_fill(scope)
-        logger.info("[fill-router] pending safe fill expired scope=%s", scope)
+        _tlog(
+            trace, "approval_check",
+            result="miss", reason="expired_pending", scope=scope,
+            pending_id=pending.get("pending_id"),
+        )
+        clear_pending_safe_fill(scope, trace=trace)
         return {
             "status": "expired",
             "scope": scope,
@@ -157,6 +339,12 @@ async def maybe_route_pending_browser_fill(
                 "Nothing was filled. Ask for a fresh preview to approve again."
             ),
         }
+
+    _tlog(
+        trace, "approval_check",
+        result="hit", reason="approval", scope=scope,
+        pending_id=pending.get("pending_id"),
+    )
 
     args: Dict[str, Any] = {
         "page_url": pending["page_url"],
@@ -170,15 +358,14 @@ async def maybe_route_pending_browser_fill(
         args["form_fill_plan"] = pending["form_fill_plan"]
 
     runner = execute or _default_execute
-    logger.info(
-        "[fill-router] approval detected; backend executing safe fill scope=%s url=%s",
-        scope, pending["page_url"],
-    )
+    _tlog(trace, "approval_execute", tool="browser_operator_safe_fill", confirmed=True, called=True)
     try:
         result = await runner(args)
     finally:
         # One approval == one execution attempt. Never replayable.
-        clear_pending_safe_fill(scope)
+        clear_pending_safe_fill(scope, trace=trace)
+
+    _tlog(trace, "backend_result", status=_result_status(result), summary=_result_summary(result))
 
     return {
         "status": "executed",

@@ -859,6 +859,25 @@ app.router.lifespan_context = _lifespan
 async def _startup_event():
     global upload_cleanup_task
     logger.info("Application starting up...")
+    # Runtime provenance: prove which code this process is running.
+    try:
+        from pathlib import Path as _Path
+        _git_head = "unknown"
+        _head_file = _Path(__file__).resolve().parent / ".git" / "HEAD"
+        if _head_file.exists():
+            _ref = _head_file.read_text(encoding="utf-8").strip()
+            if _ref.startswith("ref: "):
+                _ref_file = _head_file.parent / _ref[5:]
+                if _ref_file.exists():
+                    _git_head = _ref_file.read_text(encoding="utf-8").strip()[:8]
+            else:
+                _git_head = _ref[:8]
+        logger.info("[odysseus-runtime] git_head=%s", _git_head)
+        from src.form_fill_router import log_router_version
+        log_router_version()
+        logger.info("[odysseus-runtime] form_fill_router_loaded=true")
+    except Exception as e:
+        logger.warning("[odysseus-runtime] form_fill_router_loaded=false error=%s", e)
     webhook_manager.set_loop(asyncio.get_running_loop())
     # Wipe any leftover incognito sessions from previous process — they're
     # ephemeral by design and must not survive a restart.
