@@ -97,17 +97,20 @@ def test_smoke_prompt_parses_url_values_and_intent():
     assert parsed["known_values"] == EXPECTED_VALUES
 
 
-def test_initial_request_routes_preview_backend_side(caplog):
+def test_initial_request_executes_direct_fill_backend_side(caplog):
     caplog.set_level(logging.INFO, logger=LOGGER)
-    preview_result = {"pending_confirmation": True, "tool_name": "browser_operator_safe_fill"}
-    execute = AsyncMock(return_value=preview_result)
+    fill_result = {"output": "Browser visible fill completed.", "exit_code": 0}
+    execute = AsyncMock(return_value=fill_result)
 
     routed = _preview_route(SMOKE_PROMPT, execute)
 
-    assert routed is not None and routed["status"] == "preview"
+    assert routed is not None and routed["status"] == "executed"
+    assert routed["mode"] == "direct_fill_only"
     execute.assert_awaited_once()
     args = execute.await_args.args[0]
-    assert args["confirmed"] is False
+    assert args["confirmed"] is True
+    assert args["direct_fill_only"] is True
+    assert args["fill_only_no_approval"] is True
     assert args["visible_mode"] is True
     assert args["visible_fill_delay_ms"] == 550
     assert args["keep_browser_open"] is True
@@ -115,15 +118,15 @@ def test_initial_request_routes_preview_backend_side(caplog):
     assert args["known_values"] == EXPECTED_VALUES
     hits = _telemetry(caplog, "initial_preview_check")
     assert any("result=hit" in m for m in hits)
-    calls = _telemetry(caplog, "preview_call")
-    assert any("confirmed=False" in m and "called=True" in m for m in calls)
+    calls = _telemetry(caplog, "direct_fill_call")
+    assert any("confirmed=True" in m and "called=True" in m for m in calls)
 
 
-def test_initial_preview_records_pending_via_real_tool():
-    # Real do_browser_operator_safe_fill: preview phase must record pending
-    # for the approval router even with no browser MCP available.
+def test_explicit_preview_request_records_pending_via_real_tool():
+    # Explicit preview/review language keeps the old approval path available.
+    prompt = SMOKE_PROMPT + "\nPreview the fill plan before filling."
     routed = asyncio.run(
-        router.maybe_route_initial_preview(SMOKE_PROMPT, session_id=SESSION, trace="t-real")
+        router.maybe_route_initial_preview(prompt, session_id=SESSION, trace="t-real")
     )
     assert routed is not None and routed["status"] == "preview"
     assert routed["result"].get("pending_confirmation") is True
@@ -164,6 +167,19 @@ def test_sensitive_keys_never_parsed_into_fill_values():
     assert "password" not in parsed["known_values"]
     assert "api_key" not in parsed["known_values"]
     assert parsed["skipped_sensitive_keys"] == 2
+
+
+def test_simple_test_data_request_gets_default_normal_values():
+    msg = (
+        "Open http://127.0.0.1:8765/odysseus-smoke-form.html and fill the "
+        "normal visible form fields with simple test data. Skip password, "
+        "upload and submit."
+    )
+    parsed = router.parse_fill_request(msg)
+    assert parsed["hit"] is True
+    assert parsed["known_values"]["first_name"] == "TEST123"
+    assert parsed["known_values"]["email"] == "test123@example.com"
+    assert "password" not in parsed["known_values"]
 
 
 # ── 3. Approval routes execution before model ────────────────────────────────
@@ -307,6 +323,7 @@ SNAPSHOT_TEXT = """
 - textbox "Postcode" [ref=e13]
 - textbox "Cover letter" [ref=e15]
 - textbox "Password - should NOT be filled" [ref=e17]
+- button "CV upload" [ref=e19]
 - button "Apply now" [ref=e21]
 """
 
@@ -352,6 +369,8 @@ def test_live_fill_navigates_types_safe_fields_and_verifies():
     assert report["operator_visible_summary"]["label"] == "Browser fill proof"
     assert report["browser_session_status"] == "open_after_fill"
     assert any("Password" in b["label"] for b in report["blocked_actions"])
+    assert any("CV upload" in b["label"] for b in report["blocked_actions"])
+    assert any("Apply now" in b["label"] for b in report["blocked_actions"])
     assert report["exit_code"] == 0
 
 
@@ -374,9 +393,11 @@ def test_live_visible_fill_summary_and_delay_status():
     summary = report["operator_visible_summary"]
     assert summary["label"] == "Browser visible fill"
     assert summary["fields_filled"] == 7
-    assert summary["fields_blocked"] == 1
+    assert summary["fields_blocked"] == 3
     assert any(f["label"] == "First name" for f in summary["filled_fields"])
     assert any("Password" in f["label"] for f in summary["blocked_fields"])
+    assert any("CV upload" in f["label"] for f in summary["blocked_fields"])
+    assert any("Apply now" in f["label"] for f in summary["blocked_fields"])
     assert report["visible_mode"] is True
     assert report["keep_browser_open"] is True
     assert report["browser_session_status"] == "open_after_fill"
@@ -501,16 +522,20 @@ def test_live_fill_zero_success_output_names_per_field_reasons():
 APPROVAL_PHRASES = [
     "approved",
     "Approved.",
+    "approve",
     "yes",
     "yes approve",
     "yes approved",
+    "yes, fill it",
     "fill now",
     "proceed",
+    "Proceed",
     "go ahead",
     "continue",
     "execute fill",
     "looks good",
     "okay fill it",
+    "Approve & Fill",  # UI option label routes like text approval
 ]
 
 
@@ -628,6 +653,124 @@ def test_live_fill_result_reports_launch_mode():
     )
     launch = report["controlled_page"]["launch"]
     assert set(launch) == {"headless", "executable", "channel", "user_data_dir", "no_sandbox"}
+
+
+# ── Runtime enforcement: pending action owns the turn ────────────────────────
+
+
+def _record_pending():
+    return router.record_pending_safe_fill(
+        SCOPE,
+        page_url=PAGE_URL_LIVE,
+        known_values=EXPECTED_VALUES,
+    )
+
+
+def test_repeated_approval_after_completed_reports_already_completed():
+    _record_pending()
+    execute = AsyncMock(return_value={"output": "ok", "succeeded_count": 7, "lifecycle": "completed", "exit_code": 0})
+
+    first = _approval_route("Approved.", execute)
+    assert first["status"] == "executed"
+    execute.assert_awaited_once()
+
+    second = _approval_route("Approved.", execute)
+    assert second["status"] == "already_completed"
+    assert "already executed" in second["message"]
+    execute.assert_awaited_once()  # still exactly one execution — no duplicate fill
+
+
+def test_approval_while_executing_reports_already_executing():
+    entry = _record_pending()
+    entry["status"] = "executing"
+    execute = AsyncMock()
+
+    routed = _approval_route("Approved.", execute)
+
+    assert routed["status"] == "already_executing"
+    execute.assert_not_awaited()
+    assert router.get_pending_safe_fill(SCOPE) is not None  # untouched
+
+
+def test_fresh_preview_supersedes_completed_record():
+    _record_pending()
+    execute = AsyncMock(return_value={"output": "ok", "exit_code": 0})
+    assert _approval_route("approved", execute)["status"] == "executed"
+    assert router.has_recent_fill_activity(session_id=SESSION) is True
+
+    _record_pending()  # new preview clears the completed record
+    routed = _approval_route("approved", execute)
+    assert routed["status"] == "executed"
+    assert execute.await_count == 2
+
+
+def test_has_recent_fill_activity_covers_reporting_turns():
+    assert router.has_recent_fill_activity(session_id=SESSION) is False
+    _record_pending()
+    assert router.has_recent_fill_activity(session_id=SESSION) is True
+    execute = AsyncMock(return_value={"output": "ok", "exit_code": 0})
+    _approval_route("approved", execute)
+    # Pending consumed, but the completed record keeps browser tools pinned.
+    assert router.get_pending_safe_fill(SCOPE) is None
+    assert router.has_recent_fill_activity(session_id=SESSION) is True
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    [
+        "mcp__builtin_browser__browser_fill_form",
+        "browser_fill_form",
+        "mcp__builtin_browser__browser_type",
+        "browser_type",
+        "browser_fill",
+        "browser_select_option",
+    ],
+)
+def test_raw_fill_tools_intercepted_while_pending(tool_name, caplog):
+    _record_pending()
+    with caplog.at_level(logging.INFO, logger=LOGGER):
+        result = router.intercept_raw_fill_tool(tool_name, session_id=SESSION)
+
+    assert result is not None
+    assert result["intercepted"] == "pending_safe_fill"
+    assert "browser_operator_safe_fill" in result["error"]
+    assert any("phase=raw_fill_intercepted" in m for m in
+               (r.getMessage() for r in caplog.records))
+
+
+def test_raw_fill_tools_allowed_without_pending_or_for_other_tools():
+    assert router.intercept_raw_fill_tool("browser_type", session_id=SESSION) is None
+    _record_pending()
+    # Non-fill browser tools stay usable (snapshot/navigate/inspection).
+    assert router.intercept_raw_fill_tool("browser_snapshot", session_id=SESSION) is None
+    assert router.intercept_raw_fill_tool("browser_navigate", session_id=SESSION) is None
+    # Other chats are unaffected.
+    assert router.intercept_raw_fill_tool("browser_type", session_id="other-chat") is None
+
+
+def test_raw_fill_interception_message_while_executing():
+    entry = _record_pending()
+    entry["status"] = "executing"
+    result = router.intercept_raw_fill_tool("browser_type", session_id=SESSION)
+    assert result is not None
+    assert "already executing" in result["error"]
+
+
+def test_execute_tool_block_redirects_raw_fill_when_pending():
+    from src.tool_execution import execute_tool_block
+
+    class _Block:
+        tool_type = "mcp__builtin_browser__browser_fill_form"
+        content = "{}"
+
+    _record_pending()
+    desc, result = asyncio.run(execute_tool_block(_Block(), session_id=SESSION))
+
+    assert "REDIRECTED" in desc
+    assert result["intercepted"] == "pending_safe_fill"
+    assert result["exit_code"] == 1
+    # Pending stays intact — interception never consumes the action.
+    assert router.get_pending_safe_fill(SCOPE) is not None
 
 
 # ── Natural approval phrases (hf1) ───────────────────────────────────────────

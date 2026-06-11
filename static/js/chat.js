@@ -1788,6 +1788,25 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
                   sessionModule.updateModelPicker();
                 }
                 continue;
+              } else if (json.type === 'model_switch_visible_event') {
+                if (!_isBg) {
+                  uiModule.showToast(json.message || 'Provider stream disconnected — trying fallback model', 7000);
+                }
+                console.warn('[chat] model switch event', json);
+                continue;
+              } else if (json.type === 'provider_stream_error') {
+                console.warn('[chat] provider stream error', json);
+                if (!_isBg && json.emitted_content) {
+                  uiModule.showToast('Provider stream disconnected. Preserving partial response.', 7000);
+                }
+                continue;
+              } else if (
+                json.type === 'provider_retry_start' ||
+                json.type === 'provider_fallback_selected' ||
+                json.type === 'provider_fallback_start'
+              ) {
+                console.warn('[chat] provider fallback lifecycle', json);
+                continue;
               } else if (json.type === 'model_info') {
                 // Update role label with model name as soon as we know it
                 if (!_isBg && holder) {

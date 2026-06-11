@@ -7,6 +7,7 @@ import logging
 import hashlib
 import threading
 import re
+import uuid
 from fastapi import HTTPException
 from typing import Optional, Dict, List, Tuple
 from src.model_context import get_context_length, DEFAULT_CONTEXT
@@ -2021,6 +2022,38 @@ def _summarize_stream_error(err_chunk: Optional[str]) -> str:
     return "primary model failed"
 
 
+def _sse_data(payload: Dict) -> str:
+    return f"data: {json.dumps(payload)}\n\n"
+
+
+def _provider_runtime_event(
+    event_type: str,
+    *,
+    url: str,
+    model: str,
+    attempt: int,
+    session_id: Optional[str] = None,
+    turn_id: Optional[str] = None,
+    stream_id: Optional[str] = None,
+    role: str = "original",
+    **extra,
+) -> str:
+    payload = {
+        "type": event_type,
+        "provider": _detect_provider(url),
+        "model": model,
+        "model_id": model,
+        "attempt": attempt,
+        "attempt_role": role,
+        "session_id": session_id,
+        "turn_id": turn_id,
+        "stream_id": stream_id,
+    }
+    payload.update({k: v for k, v in extra.items() if v is not None})
+    logger.info("%s %s", event_type, payload)
+    return _sse_data(payload)
+
+
 async def stream_llm_with_fallback(candidates, messages, **kwargs):
     """Wrap stream_llm with an ordered fallback chain.
 
@@ -2034,19 +2067,61 @@ async def stream_llm_with_fallback(candidates, messages, **kwargs):
 
     Yields the same SSE chunk protocol as stream_llm.
     """
+    session_id = kwargs.pop("session_id", None)
+    turn_id = kwargs.pop("turn_id", None) or uuid.uuid4().hex
+    stream_id = kwargs.pop("stream_id", None) or uuid.uuid4().hex
+
     cands = _dedupe_candidates(candidates)
     if not cands:
         yield f'event: error\ndata: {json.dumps({"error": "No model endpoint configured", "status": 503})}\n\n'
         return
 
     primary_model = cands[0][1]
+    primary_url = cands[0][0]
     last_error = None
     for i, (url, model, headers) in enumerate(cands):
         is_last = (i == len(cands) - 1)
         emitted = False
         retried = False
+        attempt = i + 1
+        role = "original" if i == 0 else "fallback"
+        yield _provider_runtime_event(
+            "provider_request_start",
+            url=url,
+            model=model,
+            attempt=attempt,
+            session_id=session_id,
+            turn_id=turn_id,
+            stream_id=stream_id,
+            role=role,
+            selected_model=primary_model,
+        )
+        yield _provider_runtime_event(
+            "provider_stream_start",
+            url=url,
+            model=model,
+            attempt=attempt,
+            session_id=session_id,
+            turn_id=turn_id,
+            stream_id=stream_id,
+            role=role,
+            selected_model=primary_model,
+        )
         async for chunk in stream_llm(url, model, messages, headers=headers, **kwargs):
             if chunk.startswith("event: error"):
+                error_reason = _summarize_stream_error(chunk)
+                yield _provider_runtime_event(
+                    "provider_stream_error",
+                    url=url,
+                    model=model,
+                    attempt=attempt,
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    stream_id=stream_id,
+                    role=role,
+                    error=error_reason,
+                    emitted_content=emitted,
+                )
                 if not emitted and not is_last:
                     # Pre-content failure with fallbacks left — swallow and
                     # move to the next candidate.
@@ -2056,6 +2131,46 @@ async def stream_llm_with_fallback(candidates, messages, **kwargs):
                         logger.warning(f"[fallback] primary {model} failed before output; trying fallback")
                     else:
                         logger.warning(f"[fallback] candidate {model} failed; trying next")
+                    next_url, next_model, _next_headers = cands[i + 1]
+                    yield _provider_runtime_event(
+                        "provider_retry_start",
+                        url=url,
+                        model=model,
+                        attempt=attempt,
+                        session_id=session_id,
+                        turn_id=turn_id,
+                        stream_id=stream_id,
+                        role=role,
+                        reason=error_reason,
+                        next_model=next_model,
+                        next_provider=_detect_provider(next_url),
+                    )
+                    yield _provider_runtime_event(
+                        "provider_fallback_selected",
+                        url=next_url,
+                        model=next_model,
+                        attempt=attempt + 1,
+                        session_id=session_id,
+                        turn_id=turn_id,
+                        stream_id=stream_id,
+                        role="fallback",
+                        selected_model=primary_model,
+                        failed_model=model,
+                        reason=error_reason,
+                    )
+                    yield _provider_runtime_event(
+                        "model_switch_visible_event",
+                        url=next_url,
+                        model=next_model,
+                        attempt=attempt + 1,
+                        session_id=session_id,
+                        turn_id=turn_id,
+                        stream_id=stream_id,
+                        role="fallback",
+                        selected_model=primary_model,
+                        failed_model=model,
+                        message=f"Model connection failed: {model}. Retrying with fallback model: {next_model}.",
+                    )
                     break
                 yield chunk
                 continue
@@ -2075,15 +2190,47 @@ async def stream_llm_with_fallback(candidates, messages, **kwargs):
                 # model's name (e.g. a Bedrock/Claude endpoint that 400s every
                 # request but appears fine because another model silently answered).
                 if not emitted and i > 0:
+                    yield _provider_runtime_event(
+                        "provider_fallback_start",
+                        url=url,
+                        model=model,
+                        attempt=attempt,
+                        session_id=session_id,
+                        turn_id=turn_id,
+                        stream_id=stream_id,
+                        role="fallback",
+                        selected_model=primary_model,
+                        failed_model=primary_model,
+                        reason=_summarize_stream_error(last_error),
+                    )
                     yield ('data: ' + json.dumps({
                         "type": "fallback",
                         "selected_model": primary_model,
+                        "selected_provider": _detect_provider(primary_url),
                         "answered_by": model,
+                        "answered_by_provider": _detect_provider(url),
                         "reason": _summarize_stream_error(last_error),
+                        "attempt": attempt,
+                        "attempt_role": "fallback",
+                        "session_id": session_id,
+                        "turn_id": turn_id,
+                        "stream_id": stream_id,
+                        "previous_partial_abandoned": False,
                     }) + '\n\n')
                 emitted = True
             yield chunk
         if not retried:
+            yield _provider_runtime_event(
+                "provider_stream_end",
+                url=url,
+                model=model,
+                attempt=attempt,
+                session_id=session_id,
+                turn_id=turn_id,
+                stream_id=stream_id,
+                role=role,
+                emitted_content=emitted,
+            )
             return  # candidate finished (success, or terminal error already sent)
     # Every candidate failed pre-content — surface the last error.
     if last_error:

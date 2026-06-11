@@ -21,8 +21,8 @@ BROWSER_OPERATOR_RULES = """\
 - Summarize what you see for the user: page title/URL if available, visible purpose, important fields/buttons/links, safe next actions, and risky actions that need approval.
 - Drafting/preparing fields is allowed when the tool is a local prepare action. Do not submit, send, upload, buy, cancel, refund, return, delete, change account/settings/security/payment/tax/legal/admin state, or run page code without current-chat approval.
 - When filling forms, fill only safe non-sensitive text-like fields, work in small batches, verify with a fresh observation after each batch, stop before upload/submit/apply/payment/send, and report what changed or could not be verified.
-- **`browser_operator_safe_fill` is the single tool for safe form filling.** Do not narrate about calling it — actually emit the function call. Do not use `browser_fill`, `browser_type`, or `browser_select_option` directly for form-fill tasks unless `browser_operator_safe_fill` itself reports it is unavailable.
-- If a browser action returns `pending_confirmation`, show the preview to the user and wait. Only after explicit current-chat approval should you retry with `browser_operator_safe_fill` and `confirmed=true`. After `pending_confirmation`, the only correct follow-up is `browser_operator_safe_fill` with `confirmed=true`.
+- **`browser_operator_safe_fill` is the single tool for normal visible text-field form filling.** Do not narrate about calling it — actually emit the function call or let the deterministic backend route own it. Do not use `browser_fill`, `browser_type`, or `browser_select_option` directly for form-fill tasks unless `browser_operator_safe_fill` itself reports it is unavailable.
+- Normal visible text-field fill-only requests do not need a second approval. Execute them directly, verify with a fresh snapshot, leave the browser open, and report the true result. Use the preview/approval path only when the user explicitly asks to preview or approve first.
 - After a confirmed browser action, report what happened from the tool result; do not claim success if the browser/MCP tool failed or was unavailable."""
 
 BROWSER_OPERATOR_UNAVAILABLE = """\
@@ -1369,6 +1369,9 @@ _SNAPSHOT_FIELD_RE = re.compile(
     r"-\s+(textbox|searchbox|combobox|checkbox|radio|slider)\s+\"([^\"]*)\""
     r"[^\n]*?\[ref=([\w.-]+)\]"
 )
+_SNAPSHOT_CONTROL_RE = re.compile(
+    r"-\s+(button|link)\s+\"([^\"]*)\"[^\n]*?(?:\[ref=([\w.-]+)\])?"
+)
 
 # @playwright/mcp tool results carry a "Page state" block:
 #   - Page URL: http://...
@@ -1413,6 +1416,38 @@ def parse_snapshot_fill_targets(snapshot_result: Any) -> list[dict[str, Any]]:
         seen.add(ref)
         targets.append({"role": role, "label": label, "ref": ref})
     return targets
+
+
+def parse_snapshot_blocked_controls(snapshot_result: Any) -> list[dict[str, Any]]:
+    """Extract risky non-fill controls from a Playwright snapshot.
+
+    Direct fill-only may fill normal text fields immediately, but submit/apply/
+    upload/send controls must still be reported as untouched.
+    """
+    text = _mcp_result_text(snapshot_result)
+    blocked: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for match in _SNAPSHOT_CONTROL_RE.finditer(text):
+        role, label, ref = match.groups()
+        classification = classify_browser_control(label, None, role)
+        label_l = label.lower()
+        if classification != "risky" and not any(
+            word in label_l for word in ("upload", "file", "cv", "resume", "apply", "submit", "send")
+        ):
+            continue
+        key = (role, ref or label)
+        if key in seen:
+            continue
+        seen.add(key)
+        blocked.append({
+            "action": role,
+            "label": label,
+            "target": label,
+            "field_id": ref or "",
+            "reason": f"{role} control is outside normal visible text-field fill-only scope",
+            "requires_approval": True,
+        })
+    return blocked
 
 
 def _tool_call_failed(result: Any) -> str | None:
@@ -1601,7 +1636,7 @@ async def execute_live_safe_fill(
 
     plan_info = build_live_fill_plan(targets, known_values)
     skipped = plan_info["skipped"]
-    blocked = plan_info["blocked"]
+    blocked = plan_info["blocked"] + parse_snapshot_blocked_controls(snapshot_result)
     for item in blocked:
         _t("live_fill_skip", label=repr(item["label"]), reason="sensitive_field")
     for item in skipped:

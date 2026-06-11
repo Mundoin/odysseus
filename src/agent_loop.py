@@ -43,6 +43,21 @@ from src.agent_tools import (
 
 logger = logging.getLogger(__name__)
 
+_PROVIDER_RUNTIME_EVENTS = {
+    "provider_request_start",
+    "provider_stream_start",
+    "provider_stream_delta",
+    "provider_stream_error",
+    "provider_stream_end",
+    "provider_retry_start",
+    "provider_fallback_selected",
+    "provider_fallback_start",
+    "assistant_message_discarded",
+    "assistant_message_replaced",
+    "assistant_message_finalized",
+    "model_switch_visible_event",
+}
+
 
 def _load_mcp_disabled_map() -> Dict[str, set]:
     """Load per-server disabled tool sets from the database."""
@@ -188,7 +203,7 @@ _AGENT_RULES = """\
 - After a tool succeeds, do not second-guess it; reply with one short confirmation unless more work remains.
 - After a tool fails, retry with a concrete fix or state what is blocking you.
 - Finish only when the user's concrete request is actually done, or clearly state that you are blocked.
-- Local operating contract: read/search/summarise actions are allowed; drafting, preparing, or staging local content is allowed. External actions require explicit approval in the current chat before execution. Only set `confirmed=true` after that approval; if a guarded tool returns `pending_confirmation`, show or explain that preview and wait for approval before retrying. Send/submit/upload/buy/cancel/refund/return/delete/account/settings/security/payment/tax/legal/admin actions are confirmation-gated. **For browser form fills, the single approval-gated tool is `browser_operator_safe_fill` — call it without `confirmed` first for preview, then with `confirmed=true` after approval.**
+- Local operating contract: read/search/summarise actions are allowed; drafting, preparing, or staging local content is allowed. External actions require explicit approval in the current chat before execution. Only set `confirmed=true` after that approval; if a guarded tool returns `pending_confirmation`, show or explain that preview and wait for approval before retrying. Send/submit/upload/buy/cancel/refund/return/delete/account/settings/security/payment/tax/legal/admin actions are confirmation-gated. **Normal visible browser text-field fill-only actions are allowed as local prepare through `browser_operator_safe_fill`; they do not require a second approval. Password/upload/submit/apply/payment/send controls stay blocked.**
 - User identity facts/preferences ("my name is X", "call me X", "I live in X") use `manage_memory`, not contacts.
 """
 
@@ -202,7 +217,7 @@ _API_AGENT_RULES = """\
 - After a tool succeeds, do not second-guess it; reply with one short confirmation unless more work remains.
 - After a tool fails, retry with a concrete fix or state what is blocking you.
 - Finish only when the user's concrete request is actually done, or clearly state that you are blocked.
-- Local operating contract: read/search/summarise actions are allowed; drafting, preparing, or staging local content is allowed. External actions require explicit approval in the current chat before execution. Only set `confirmed=true` after that approval; if a guarded tool returns `pending_confirmation`, show or explain that preview and wait for approval before retrying. Send/submit/upload/buy/cancel/refund/return/delete/account/settings/security/payment/tax/legal/admin actions are confirmation-gated. **For browser form fills, the single approval-gated tool is `browser_operator_safe_fill` — call it without `confirmed` first for preview, then with `confirmed=true` after approval.**
+- Local operating contract: read/search/summarise actions are allowed; drafting, preparing, or staging local content is allowed. External actions require explicit approval in the current chat before execution. Only set `confirmed=true` after that approval; if a guarded tool returns `pending_confirmation`, show or explain that preview and wait for approval before retrying. Send/submit/upload/buy/cancel/refund/return/delete/account/settings/security/payment/tax/legal/admin actions are confirmation-gated. **Normal visible browser text-field fill-only actions are allowed as local prepare through `browser_operator_safe_fill`; they do not require a second approval. Password/upload/submit/apply/payment/send controls stay blocked.**
 - User identity facts/preferences ("my name is X", "call me X", "I live in X") use `manage_memory`, not contacts.
 """
 
@@ -276,9 +291,9 @@ _DOMAIN_RULES = {
 - Read-only tools (snapshot, screenshot, console/network inspection) are always allowed.
 - Filling safe text-like fields is allowed as local prepare. Stop before any submit/upload/apply/payment/send action. Submit, upload, apply, and payment actions remain blocked.
 - **`browser_operator_safe_fill` is the mandated tool for safe form filling.** Use it for any form-fill intent. Do not claim success unless `browser_operator_safe_fill` (or its verified backend) returns a confirmed-fill result. Do not switch to `browser_type`, `browser_fill`, or `browser_select_option` directly unless `browser_operator_safe_fill` reports unavailable AND the fallback is explicitly allowed.
-- If a browser tool returns `pending_confirmation`, show the preview to the user and wait for explicit chat approval. Only then retry with `browser_operator_safe_fill` and `confirmed=true`. Do not re-request approval for the same safe fill batch after user approval — just call `browser_operator_safe_fill` with `confirmed=true`. After user approval, the next assistant step must call `browser_operator_safe_fill` with `confirmed=true`.
+- If a browser tool returns `pending_confirmation`, show the preview to the user and wait for explicit chat approval. This only applies when the user explicitly requested preview/approval first. Normal visible text-field fill-only requests should execute directly through the backend route.
 - If the browser runtime is not connected, say "Browser automation runtime is not connected" and list the missing setup (npx @playwright/mcp must be cached). Do not pretend browser tools exist.
-- Safe fill workflow: after the user explicitly approves a fill plan, execute fills using `browser_operator_safe_fill`. Do NOT ask for approval again for the same approved fill batch — proceed to execute.
+- Safe fill workflow: for normal visible text fields, execute fills using `browser_operator_safe_fill` without a second approval, verify with a fresh snapshot, and report the exact result. Do NOT use raw browser fill/type tools for this flow.
 - Batch safe fills in groups of 2-3 fields, then verify with a snapshot after each batch. Report which fields succeeded, failed, or could not be verified.
 - If no fill/type/select tools are available, say which specific tool names are missing, not "browser tools are unavailable".""",
 }
@@ -1790,6 +1805,8 @@ async def stream_agent_loop(
     context_length: int = 0,
     active_document=None,
     session_id: Optional[str] = None,
+    turn_id: Optional[str] = None,
+    stream_id: Optional[str] = None,
     disabled_tools: Optional[Set[str]] = None,
     owner: Optional[str] = None,
     relevant_tools: Optional[Set[str]] = None,
@@ -1892,6 +1909,9 @@ async def stream_agent_loop(
                 _routed_preview = await maybe_route_initial_preview(
                     _last_user, session_id=session_id, owner=owner, trace=_fill_trace
                 )
+                if _routed_preview and _routed_preview.get("status") == "executed":
+                    _routed_fill = _routed_preview
+                    _routed_preview = None
         except Exception:
             logger.exception("[fill-router] router failed; using normal agent flow")
             _routed_fill = None
@@ -1900,7 +1920,7 @@ async def stream_agent_loop(
         messages = list(messages)
         if _routed_fill.get("status") == "executed":
             _fill_result = _routed_fill.get("result") or {}
-            _fill_cmd = f"approval-router confirmed fill: {_routed_fill.get('page_url', '')}"
+            _fill_cmd = f"browser visible fill: {_routed_fill.get('page_url', '')}"
             yield 'data: ' + json.dumps({
                 "type": "tool_start",
                 "tool": "browser_operator_safe_fill",
@@ -1935,9 +1955,8 @@ async def stream_agent_loop(
             messages.append({
                 "role": "user",
                 "content": (
-                    "[odysseus-backend] The user approved the pending safe form fill. "
-                    "Odysseus already executed browser_operator_safe_fill with "
-                    "confirmed=true on the backend. Verified result:\n"
+                    "[odysseus-backend] Odysseus already executed the normal "
+                    "visible text-field fill directly on the backend. Verified result:\n"
                     f"{_fill_summary}\n"
                     "Report this to the user in this compact style, nothing more:\n"
                     "Filled: <succeeded_count> safe fields verified\n"
@@ -1946,9 +1965,21 @@ async def stream_agent_loop(
                     "Browser: left open (or managed by browser MCP)\n"
                     "If lifecycle is not 'completed', lead with the failure_category "
                     "and one next useful step instead of any success language. "
-                    "Do NOT call any browser or fill tools again for this batch, and "
-                    "do NOT ask for approval again. Password, upload and submit/apply "
-                    "controls were not touched and remain blocked."
+                    "Do not call ANY tools this turn — no browser tools, no skills, "
+                    "no inspection. Do NOT ask for approval again. Password, upload "
+                    "and submit/apply controls were not touched and remain blocked."
+                ),
+            })
+        elif _routed_fill.get("status") in ("already_completed", "already_executing"):
+            _dup_msg = _routed_fill.get("message", "The browser form fill was already handled.")
+            yield 'data: ' + json.dumps({"delta": _dup_msg + "\n\n"}) + '\n\n'
+            messages.append({
+                "role": "user",
+                "content": (
+                    "[odysseus-backend] " + _dup_msg + " Report this to the user in "
+                    "one short sentence. Do not call any tools. Do not ask for "
+                    "approval again. Do not start a new fill unless the user asks "
+                    "for a fresh preview."
                 ),
             })
         elif _routed_fill.get("status") == "expired":
@@ -2031,11 +2062,11 @@ async def stream_agent_loop(
     # and the model can still act instead of claiming it has no browser tools.
     if not (plan_mode or guide_only):
         try:
-            from src.form_fill_router import has_pending_safe_fill
+            from src.form_fill_router import has_recent_fill_activity
             if (
                 _had_pending_fill
                 or _routed_fill is not None
-                or has_pending_safe_fill(session_id=session_id, owner=owner)
+                or has_recent_fill_activity(session_id=session_id, owner=owner)
             ):
                 _intent["domains"] = set(_intent.get("domains") or set()) | {"browser"}
                 logger.info(
@@ -2535,6 +2566,9 @@ async def stream_agent_loop(
             prompt_type=prompt_type if round_num == 1 else None,
             tools=all_tool_schemas if all_tool_schemas else None,
             timeout=agent_stream_timeout,
+            session_id=session_id,
+            turn_id=turn_id,
+            stream_id=stream_id,
         ):
             if time.time() > _round_deadline:
                 logger.warning(f"[agent] round {round_num} stream exceeded wall-clock deadline; cutting off")
@@ -2611,6 +2645,8 @@ async def stream_agent_loop(
                         actual_model = data.get("answered_by") or actual_model
                         logger.warning(f"[agent] round {round_num} fell back: "
                                        f"{data.get('selected_model')} -> {data.get('answered_by')}")
+                        yield chunk
+                    elif data.get("type") in _PROVIDER_RUNTIME_EVENTS:
                         yield chunk
                     elif data.get("type") == "model_actual":
                         actual_model = data.get("model") or actual_model

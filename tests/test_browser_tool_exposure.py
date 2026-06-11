@@ -345,8 +345,8 @@ def test_browser_operator_rules_constant_exists_and_is_non_empty():
     from src.browser_operator import BROWSER_OPERATOR_RULES
 
     assert "Browser operator workflow" in BROWSER_OPERATOR_RULES
-    assert "pending_confirmation" in BROWSER_OPERATOR_RULES
-    assert "confirmed=true" in BROWSER_OPERATOR_RULES
+    assert "do not need a second approval" in BROWSER_OPERATOR_RULES
+    assert "preview/approval path only when the user explicitly asks" in BROWSER_OPERATOR_RULES
     assert len(BROWSER_OPERATOR_RULES) > 100
 
 
@@ -772,7 +772,7 @@ def test_domain_rules_mandate_safe_fill_tool():
     assert "browser_operator_safe_fill" in rules, "Must mandate browser_operator_safe_fill"
     assert "Do not claim success" in rules or "do not claim success" in rules, "Must prohibit claiming success without tool result"
     assert "browser_type" in rules and "browser_fill" in rules, "Must mention low-level fallback restriction"
-    assert "confirmed=true" in rules, "Must mention confirmed=true for approval follow-up"
+    assert "without a second approval" in rules, "Must mention direct normal fill-only flow"
 
 
 def test_operator_rules_mandate_safe_fill():
@@ -782,7 +782,7 @@ def test_operator_rules_mandate_safe_fill():
     assert "browser_operator_safe_fill" in BROWSER_OPERATOR_RULES, "Must mandate browser_operator_safe_fill"
     assert "single tool" in BROWSER_OPERATOR_RULES.lower() or "single" in BROWSER_OPERATOR_RULES.lower(), "Must identify as single tool"
     assert "do not narrate" in BROWSER_OPERATOR_RULES.lower() or "do not use" in BROWSER_OPERATOR_RULES, "Must prohibit narrating without calling"
-    assert "confirmed=true" in BROWSER_OPERATOR_RULES, "Must require confirmed=true after approval"
+    assert "do not need a second approval" in BROWSER_OPERATOR_RULES, "Must allow direct normal fill-only flow"
 
 
 def test_model_not_to_claim_success_without_tool_result():

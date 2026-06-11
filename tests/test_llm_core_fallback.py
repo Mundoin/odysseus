@@ -36,7 +36,11 @@ def test_fallback_emits_indicator_when_primary_fails(monkeypatch):
             return ['event: error\ndata: {"status": 400, "text": "Provider X returned HTTP 400"}\n\n']
         return ['data: {"delta": "hello"}\n\n', "data: [DONE]\n\n"]
     chunks = _run_fallback(monkeypatch, per_model)
-    fb = [json.loads(c[6:]) for c in chunks if c.startswith("data: ") and '"fallback"' in c]
+    fb = [
+        json.loads(c[6:])
+        for c in chunks
+        if c.startswith("data: ") and c[6:].lstrip().startswith("{") and json.loads(c[6:]).get("type") == "fallback"
+    ]
     assert fb, f"no fallback event in {chunks}"
     assert fb[0]["type"] == "fallback"
     assert fb[0]["selected_model"] == "primary"
@@ -46,6 +50,69 @@ def test_fallback_emits_indicator_when_primary_fails(monkeypatch):
     order = [i for i, c in enumerate(chunks) if '"fallback"' in c or '"delta": "hello"' in c]
     assert order == sorted(order)
     assert any('"delta": "hello"' in c for c in chunks)
+    lifecycle = [json.loads(c[6:]) for c in chunks if c.startswith("data: ") and "provider_" in c]
+    lifecycle_types = {event["type"] for event in lifecycle}
+    assert "provider_request_start" in lifecycle_types
+    assert "provider_stream_error" in lifecycle_types
+    assert "provider_retry_start" in lifecycle_types
+    assert "provider_fallback_selected" in lifecycle_types
+    assert "provider_fallback_start" in lifecycle_types
+    assert "provider_stream_end" in lifecycle_types
+
+
+def test_fallback_runtime_events_carry_turn_metadata(monkeypatch):
+    def per_model(model):
+        if model == "deepseek-v4-flash":
+            return ['event: error\ndata: {"status": 503, "error": "offline"}\n\n']
+        return ['data: {"delta": "ok"}\n\n', "data: [DONE]\n\n"]
+
+    async def fake_stream(url, model, messages, **kw):
+        for ln in per_model(model):
+            yield ln
+
+    monkeypatch.setattr(llm_core, "stream_llm", fake_stream)
+
+    async def run():
+        out = []
+        async for c in llm_core.stream_llm_with_fallback(
+            [("https://api.deepseek.com/v1", "deepseek-v4-flash", {}), ("https://mimo.example/v1", "mimo-v2.5-pro", {})],
+            [{"role": "user", "content": "hi"}],
+            session_id="sess-1",
+            turn_id="turn-1",
+            stream_id="stream-1",
+        ):
+            out.append(c)
+        return out
+
+    chunks = asyncio.run(run())
+    events = [json.loads(c[6:]) for c in chunks if c.startswith("data: ") and c[6:].lstrip().startswith("{")]
+    switch = [e for e in events if e.get("type") == "model_switch_visible_event"]
+    assert switch, chunks
+    assert switch[0]["session_id"] == "sess-1"
+    assert switch[0]["turn_id"] == "turn-1"
+    assert switch[0]["stream_id"] == "stream-1"
+    assert switch[0]["failed_model"] == "deepseek-v4-flash"
+    assert switch[0]["model"] == "mimo-v2.5-pro"
+    assert "Retrying with fallback model" in switch[0]["message"]
+    fallback = [e for e in events if e.get("type") == "fallback"][0]
+    assert fallback["answered_by_provider"]
+    assert fallback["attempt"] == 2
+
+
+def test_mid_stream_error_is_not_retried_silently(monkeypatch):
+    def per_model(model):
+        if model == "primary":
+            return [
+                'data: {"delta": "partial"}\n\n',
+                'event: error\ndata: {"status": 502, "error": "stream died"}\n\n',
+            ]
+        return ['data: {"delta": "should-not-run"}\n\n', "data: [DONE]\n\n"]
+
+    chunks = _run_fallback(monkeypatch, per_model)
+    assert any('"delta": "partial"' in c for c in chunks)
+    assert any(c.startswith("event: error") and "stream died" in c for c in chunks)
+    assert not any("should-not-run" in c for c in chunks)
+    assert any('"type": "provider_stream_error"' in c for c in chunks)
 
 
 def test_no_fallback_event_when_primary_succeeds(monkeypatch):

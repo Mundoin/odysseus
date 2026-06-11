@@ -1,17 +1,17 @@
-"""Deterministic routers for browser safe-fill: initial preview + approval.
+"""Deterministic routers for browser safe-fill: direct fill + optional preview.
 
 Stage: odysseus-browser-form-fill-live-proof-router-diagnostics-v1
 (supersedes odysseus-browser-form-fill-autopilot-router-v1)
 
 Two model-independent routing points, both running BEFORE model tool choice:
 
-1. Initial preview router — a user message carrying a URL, key:value fill
-   values and explicit fill intent triggers a backend call to
-   `browser_operator_safe_fill` with ``confirmed=false``. The preview and
-   pending action exist before the model can narrate tool usage.
+1. Direct fill-only router — a user message carrying a URL and normal
+   text-field fill intent triggers backend-owned `browser_operator_safe_fill`
+   with ``direct_fill_only=true``. No approval loop is required for this narrow
+   action class.
 
-2. Approval router — a pending safe-fill plus a short approval message
-   triggers backend execution with ``confirmed=true``.
+2. Optional preview router — if the user explicitly asks to preview/review
+   before filling, the old pending approval path remains available.
 
 Every decision emits structured telemetry:
     [form-fill-router] trace=<id> phase=<phase> key=value ...
@@ -43,6 +43,18 @@ PENDING_SAFE_FILL_TTL_SECONDS = 15 * 60
 
 # scope -> pending safe-fill request (raw args needed for backend re-execution)
 _PENDING_SAFE_FILL: Dict[str, Dict[str, Any]] = {}
+
+# scope -> redacted record of the last completed safe fill. Lets a repeated
+# approval report "already completed" instead of re-running or confusing the
+# model, and keeps browser tools pinned for the reporting turns.
+_COMPLETED_SAFE_FILL: Dict[str, Dict[str, Any]] = {}
+COMPLETED_SAFE_FILL_TTL_SECONDS = 15 * 60
+
+# Raw fill/type tools the model must not improvise with while a safe-fill
+# action is pending — the canonical wrapper owns execution.
+_RAW_FILL_TOOL_BARE_NAMES = frozenset({
+    "browser_fill_form", "browser_fill", "browser_type", "browser_select_option",
+})
 
 # Short messages only — a paragraph is instructions, not an approval.
 _MAX_APPROVAL_LENGTH = 80
@@ -77,6 +89,12 @@ _URL_RE = re.compile(r"https?://[^\s<>\"'\)\]]+")
 _FILL_INTENT_RE = re.compile(
     r"(?i)\b(fill|form[- ]?fill|safe fields|provided values|enter (?:these|the) values)\b"
 )
+_EXPLICIT_PREVIEW_RE = re.compile(
+    r"(?i)\b(preview|review first|show (?:me )?(?:the )?plan|ask (?:me )?before|approve first|approval first)\b"
+)
+_TEST_DATA_RE = re.compile(
+    r"(?i)\b(simple test data|test data|dummy data|sample data|normal visible form fields|normal fields)\b"
+)
 _KV_LINE_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_ ]{0,40}?)\s*:\s*(\S.*)$")
 
 # Keys never accepted as fill values, even if the user provides them inline.
@@ -87,6 +105,16 @@ _SENSITIVE_KEY_RE = re.compile(
 # key:value parsing must not swallow prose lines ("Open this page in the
 # browser, then inspect it:") — keys are short identifiers, max 3 words.
 _MAX_KEY_WORDS = 3
+
+DEFAULT_NORMAL_FIELD_TEST_VALUES: Dict[str, str] = {
+    "first_name": "TEST123",
+    "last_name": "VISIBLE",
+    "email": "test123@example.com",
+    "phone": "+49123456789",
+    "city": "Dortmund",
+    "postcode": "44137",
+    "cover_letter": "Visible fill proof test cover letter.",
+}
 
 
 def new_trace_id() -> str:
@@ -134,6 +162,8 @@ def record_pending_safe_fill(
         "status": "pending_approval",
     }
     _PENDING_SAFE_FILL[scope] = entry
+    # A fresh preview supersedes any previous completed record for this chat.
+    _COMPLETED_SAFE_FILL.pop(scope, None)
     _tlog(
         trace, "pending_recorded",
         pending_id=entry["pending_id"], scope=scope,
@@ -163,9 +193,100 @@ def has_pending_safe_fill(
     return time.time() <= float(entry.get("expires_at", 0))
 
 
+def has_recent_fill_activity(
+    session_id: Optional[str] = None, owner: Optional[str] = None
+) -> bool:
+    """True while this chat has a pending OR recently completed safe fill.
+
+    Used by the agent loop to keep browser tools pinned across the whole
+    flow — pending, executing and reporting turns — so the tool schema set
+    can never collapse mid-conversation."""
+    if has_pending_safe_fill(session_id=session_id, owner=owner):
+        return True
+    scope = browser_action_scope(session_id=session_id, owner=owner)
+    completed = _COMPLETED_SAFE_FILL.get(scope)
+    return bool(completed and time.time() <= float(completed.get("expires_at", 0)))
+
+
+def _record_completed_safe_fill(
+    scope: str,
+    pending: Dict[str, Any],
+    result: Any,
+    trace: Optional[str] = None,
+) -> None:
+    """Remember (redacted) that this scope's fill was executed, so repeated
+    approvals report 'already completed' instead of re-running."""
+    result_dict = result if isinstance(result, dict) else {}
+    now = time.time()
+    record = {
+        "pending_id": pending.get("pending_id"),
+        "page_url": pending.get("page_url"),
+        "completed_at": now,
+        "expires_at": now + COMPLETED_SAFE_FILL_TTL_SECONDS,
+        "lifecycle": result_dict.get("lifecycle"),
+        "succeeded_count": result_dict.get("succeeded_count"),
+        "output": _result_summary(result_dict),
+    }
+    _COMPLETED_SAFE_FILL[scope] = record
+    _tlog(
+        trace, "completed_recorded",
+        pending_id=record["pending_id"], scope=scope,
+        lifecycle=record["lifecycle"], succeeded=record["succeeded_count"],
+    )
+
+
+def intercept_raw_fill_tool(
+    tool_name: str,
+    *,
+    session_id: Optional[str] = None,
+    owner: Optional[str] = None,
+    trace: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Runtime enforcement: while a safe-fill action is pending for this
+    chat, the model may not improvise raw browser fill/type tool calls —
+    the canonical wrapper owns execution. Returns a short-circuit result
+    dict, or None to allow the call."""
+    bare = str(tool_name or "").rsplit("__", 1)[-1]
+    if bare not in _RAW_FILL_TOOL_BARE_NAMES:
+        return None
+    scope = browser_action_scope(session_id=session_id, owner=owner)
+    pending = _PENDING_SAFE_FILL.get(scope)
+    if not pending or pending.get("kind") != "browser_safe_fill":
+        return None
+    if time.time() > float(pending.get("expires_at", 0)):
+        return None
+    status = pending.get("status", "pending_approval")
+    _tlog(
+        trace, "raw_fill_intercepted",
+        tool=tool_name, scope=scope,
+        pending_id=pending.get("pending_id"), pending_status=status,
+    )
+    if status == "executing":
+        message = (
+            "The approved browser form fill is already executing on the backend. "
+            "Do not call browser tools. Wait for the backend result and report it."
+        )
+    else:
+        message = (
+            "A pending browser safe form fill exists for this chat "
+            f"(id {pending.get('pending_id')}). Do not improvise raw browser "
+            "fill/type tool calls. When the user approves, Odysseus executes the "
+            "pending action automatically on the backend; until then, show the "
+            "preview and wait. The only valid form-fill tool is "
+            "browser_operator_safe_fill."
+        )
+    return {
+        "error": message,
+        "intercepted": "pending_safe_fill",
+        "pending_id": pending.get("pending_id"),
+        "exit_code": 1,
+    }
+
+
 def clear_pending_safe_fill(scope: Optional[str] = None, trace: Optional[str] = None) -> None:
     if scope is None:
         _PENDING_SAFE_FILL.clear()
+        _COMPLETED_SAFE_FILL.clear()
         return
     entry = _PENDING_SAFE_FILL.pop(scope, None)
     if entry:
@@ -229,6 +350,9 @@ def parse_fill_request(message: str) -> Dict[str, Any]:
             continue
         known_values[key.lower().replace(" ", "_")] = value
 
+    if not known_values and _TEST_DATA_RE.search(text):
+        known_values = dict(DEFAULT_NORMAL_FIELD_TEST_VALUES)
+
     if not known_values:
         return {"hit": False, "reason": "no_fill_values"}
 
@@ -237,6 +361,7 @@ def parse_fill_request(message: str) -> Dict[str, Any]:
         "page_url": page_url,
         "known_values": known_values,
         "skipped_sensitive_keys": skipped_sensitive,
+        "explicit_preview": bool(_EXPLICIT_PREVIEW_RE.search(text)),
     }
 
 
@@ -278,13 +403,13 @@ async def maybe_route_initial_preview(
     execute: Optional[Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None,
     trace: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Deterministic initial preview router. Runs BEFORE model tool choice.
+    """Deterministic initial direct-fill/preview router. Runs before model choice.
 
-    A message with URL + key:value fill values + explicit fill intent gets a
-    backend `browser_operator_safe_fill confirmed=false` call immediately:
-    preview and pending action exist regardless of what the model narrates.
+    Normal fill-only requests execute immediately. If the user explicitly asks
+    for a preview/review/approval first, the old pending preview path is used.
 
-    Returns None (no route) or {"status": "preview", "result": <preview>}.
+    Returns None (no route), {"status": "executed", ...}, or
+    {"status": "preview", "result": <preview>}.
     """
     parsed = parse_fill_request(user_message)
     if not parsed.get("hit"):
@@ -306,7 +431,9 @@ async def maybe_route_initial_preview(
     args: Dict[str, Any] = {
         "page_url": parsed["page_url"],
         "known_values": parsed["known_values"],
-        "confirmed": False,
+        "confirmed": bool(not parsed.get("explicit_preview")),
+        "direct_fill_only": bool(not parsed.get("explicit_preview")),
+        "fill_only_no_approval": bool(not parsed.get("explicit_preview")),
         "visible_mode": True,
         "visible_fill_delay_ms": 550,
         "keep_browser_open": True,
@@ -315,10 +442,24 @@ async def maybe_route_initial_preview(
         "_trace": trace,
     }
     runner = execute or _default_execute
-    _tlog(trace, "preview_call", tool="browser_operator_safe_fill", confirmed=False, called=True)
+    if parsed.get("explicit_preview"):
+        _tlog(trace, "preview_call", tool="browser_operator_safe_fill", confirmed=False, called=True)
+    else:
+        _tlog(trace, "direct_fill_call", tool="browser_operator_safe_fill", confirmed=True, called=True)
     result = await runner(args)
     status = _result_status(result)
     _tlog(trace, "backend_result", status=status, summary=_result_summary(result))
+
+    if not parsed.get("explicit_preview"):
+        return {
+            "status": "executed",
+            "scope": scope,
+            "page_url": parsed["page_url"],
+            "values_count": len(parsed["known_values"]),
+            "result": result,
+            "trace": trace,
+            "mode": "direct_fill_only",
+        }
 
     return {
         "status": "preview",
@@ -348,6 +489,28 @@ async def maybe_route_pending_browser_fill(
     scope = browser_action_scope(session_id=session_id, owner=owner)
     pending = _PENDING_SAFE_FILL.get(scope)
     if not pending or pending.get("kind") != "browser_safe_fill":
+        # Repeated approval after the fill already ran: report the existing
+        # result instead of confusing the model into a second approval loop.
+        completed = _COMPLETED_SAFE_FILL.get(scope)
+        if completed and time.time() <= float(completed.get("expires_at", 0)):
+            hit, _ = approval_check(user_message)
+            if hit:
+                _tlog(
+                    trace, "approval_check",
+                    result="hit", reason="already_completed", scope=scope,
+                    pending_id=completed.get("pending_id"),
+                )
+                return {
+                    "status": "already_completed",
+                    "scope": scope,
+                    "page_url": completed.get("page_url"),
+                    "message": (
+                        "That browser form fill was already executed. Result: "
+                        f"{completed.get('output') or 'reported earlier in this chat'}. "
+                        "Nothing was re-run. Ask for a fresh preview to fill again."
+                    ),
+                    "completed": dict(completed),
+                }
         # other_pending_scopes > 0 with a miss here means the preview was
         # recorded under a different scope (session/owner mismatch between
         # turns) — the classic "approved but nothing happened" diagnostic.
@@ -384,11 +547,28 @@ async def maybe_route_pending_browser_fill(
             ),
         }
 
+    if pending.get("status") == "executing":
+        _tlog(
+            trace, "approval_check",
+            result="hit", reason="already_executing", scope=scope,
+            pending_id=pending.get("pending_id"),
+        )
+        return {
+            "status": "already_executing",
+            "scope": scope,
+            "page_url": pending.get("page_url"),
+            "message": (
+                "The approved browser form fill is already executing. "
+                "No second run was started. Wait for its result."
+            ),
+        }
+
     _tlog(
         trace, "approval_check",
         result="hit", reason="approval", scope=scope,
         pending_id=pending.get("pending_id"),
     )
+    pending["status"] = "executing"
 
     args: Dict[str, Any] = {
         "page_url": pending["page_url"],
@@ -412,6 +592,7 @@ async def maybe_route_pending_browser_fill(
         # One approval == one execution attempt. Never replayable.
         clear_pending_safe_fill(scope, trace=trace)
 
+    _record_completed_safe_fill(scope, pending, result, trace=trace)
     _tlog(trace, "backend_result", status=_result_status(result), summary=_result_summary(result))
 
     return {

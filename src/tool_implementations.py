@@ -4674,8 +4674,9 @@ async def do_browser_operator_safe_fill(
 ) -> Dict:
     """Fill safe non-sensitive form fields on the current browser page.
 
-    Two-phase: first call without ``confirmed`` returns a redacted preview.
-    Re-call with ``confirmed=true`` to execute fills via the browser MCP.
+    Normal direct fill-only calls execute immediately when ``direct_fill_only``
+    is true. The older preview/confirmed path remains available for explicit
+    preview requests.
     """
     from src.browser_operator import (
         build_safe_browser_fill_calls,
@@ -4702,7 +4703,8 @@ async def do_browser_operator_safe_fill(
     known_values = args.get("known_values", {}) or {}
     form_fill_plan = args.get("form_fill_plan", None)
     fields_to_fill = args.get("fields_to_fill", None)
-    confirmed = args.get("confirmed", False)
+    direct_fill_only = bool(args.get("direct_fill_only") or args.get("fill_only_no_approval"))
+    confirmed = bool(args.get("confirmed", False) or direct_fill_only)
     batch_size = int(args.get("batch_size", 3) or 3)
     visible_mode = args.get("visible_mode", None)
     if visible_mode is None:
@@ -4864,7 +4866,7 @@ async def do_browser_operator_safe_fill(
     # one approval, one execution, regardless of which path fired first.
     from src.form_fill_router import clear_pending_safe_fill
     clear_pending_safe_fill(scope)
-    if not consume_browser_pending_action(scope, tool_name, fill_args_for_fingerprint):
+    if not direct_fill_only and not consume_browser_pending_action(scope, tool_name, fill_args_for_fingerprint):
         # No matching pending action — someone changed the request or this is
         # a new session. Return a preview so the user can re-approve.
         bridge = build_safe_browser_fill_calls(

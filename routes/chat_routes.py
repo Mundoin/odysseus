@@ -5,6 +5,7 @@ import json
 import os
 import time
 import logging
+import uuid
 from datetime import datetime
 from typing import Dict, Any, AsyncGenerator, List
 
@@ -47,6 +48,20 @@ logger = logging.getLogger(__name__)
 # Track active streams for partial-save safety net
 _active_streams: Dict[str, dict] = {}
 _IMAGE_MODEL_PREFIXES = ("gpt-image", "dall-e", "chatgpt-image")
+_PROVIDER_RUNTIME_EVENTS = {
+    "provider_request_start",
+    "provider_stream_start",
+    "provider_stream_delta",
+    "provider_stream_error",
+    "provider_stream_end",
+    "provider_retry_start",
+    "provider_fallback_selected",
+    "provider_fallback_start",
+    "assistant_message_discarded",
+    "assistant_message_replaced",
+    "assistant_message_finalized",
+    "model_switch_visible_event",
+}
 
 
 def _stream_set(session_id: str, **fields) -> None:
@@ -60,6 +75,37 @@ def _stream_set(session_id: str, **fields) -> None:
     if rec is None:
         return
     rec.update(fields)
+
+
+def _parse_sse_data(chunk: str) -> Dict:
+    try:
+        for line in (chunk or "").splitlines():
+            if line.startswith("data: "):
+                return json.loads(line[6:])
+    except Exception:
+        return {}
+    return {}
+
+
+def _provider_error_text(chunk: str) -> str:
+    data = _parse_sse_data(chunk)
+    if not data:
+        return "Provider stream disconnected."
+    return str(
+        data.get("error")
+        or data.get("text")
+        or data.get("message")
+        or data.get("detail")
+        or "Provider stream disconnected."
+    )
+
+
+def _model_switch_notice(data: Dict, requested_model: str) -> str:
+    failed = data.get("selected_model") or data.get("failed_model") or requested_model or "selected model"
+    answered_by = data.get("answered_by") or data.get("model") or "fallback model"
+    reason = data.get("reason") or data.get("error") or ""
+    suffix = f" Reason: {reason}" if reason else ""
+    return f"\n\nModel connection failed: {failed}. Retrying with fallback model: {answered_by}.{suffix}\n\n"
 
 
 def _session_url_matches_endpoint(session_url: str, endpoint_base: str) -> bool:
@@ -923,6 +969,9 @@ def setup_chat_routes(
             # Send model name early so the frontend can show it during streaming
             _model_suffix = "Research" if effective_do_research else None
             _model_info = {"type": "model_info", "model": sess.model}
+            _turn_id = uuid.uuid4().hex
+            _stream_id = uuid.uuid4().hex
+            _provider_events: List[Dict[str, Any]] = []
             if _model_suffix:
                 _model_info["suffix"] = _model_suffix
             if ctx.preset.character_name:
@@ -988,6 +1037,9 @@ def setup_chat_routes(
                         max_tokens=ctx.preset.max_tokens,
                         prompt_type=preset_id,
                         tools=None,
+                        session_id=session,
+                        turn_id=_turn_id,
+                        stream_id=_stream_id,
                     ):
                         if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]"):
                             try:
@@ -1007,7 +1059,15 @@ def setup_chat_routes(
                                     _answered_by = data.get("answered_by") or _answered_by
                                     _actual_model = _actual_model or _answered_by
                                     data["selected_model"] = data.get("selected_model") or _requested_model
-                                    yield chunk
+                                    _provider_events.append(dict(data))
+                                    _notice = _model_switch_notice(data, _requested_model)
+                                    full_response += _notice
+                                    _stream_set(session, partial=full_response)
+                                    yield f'data: {json.dumps({"delta": _notice, "type": "model_switch_visible_event", "model": _answered_by, "requested_model": _requested_model, "session_id": session, "turn_id": _turn_id, "stream_id": _stream_id})}\n\n'
+                                    yield f'data: {json.dumps(data)}\n\n'
+                                elif data.get("type") in _PROVIDER_RUNTIME_EVENTS:
+                                    _provider_events.append(dict(data))
+                                    yield f'data: {json.dumps(data)}\n\n'
                                 elif data.get("type") == "model_actual":
                                     _actual_model = data.get("model") or _actual_model
                                     data["requested_model"] = _requested_model
@@ -1017,6 +1077,11 @@ def setup_chat_routes(
                                     _reported_model = last_metrics.get("model")
                                     last_metrics["requested_model"] = _requested_model
                                     last_metrics["model"] = _reported_model or _actual_model or _answered_by or _requested_model
+                                    if _provider_events:
+                                        last_metrics["provider_events"] = _provider_events
+                                    last_metrics["session_id"] = session
+                                    last_metrics["turn_id"] = _turn_id
+                                    last_metrics["stream_id"] = _stream_id
                                     if ctx.context_length and last_metrics.get("input_tokens"):
                                         pct = min(round((last_metrics["input_tokens"] / ctx.context_length) * 100, 1), 100.0)
                                         last_metrics["context_percent"] = pct
@@ -1035,6 +1100,41 @@ def setup_chat_routes(
                                 yield chunk
                         elif chunk.startswith("event: error"):
                             logger.warning(f"Stream error for {sess.model} on {sess.endpoint_url}: {chunk!r}")
+                            _provider_events.append({
+                                "type": "provider_stream_error",
+                                "model": _actual_model or _answered_by or _requested_model,
+                                "requested_model": _requested_model,
+                                "session_id": session,
+                                "turn_id": _turn_id,
+                                "stream_id": _stream_id,
+                                "error": _provider_error_text(chunk),
+                                "partial_response_abandoned": bool(full_response),
+                            })
+                            if full_response:
+                                _interrupted_note = (
+                                    "\n\nProvider stream disconnected before finalization. "
+                                    "Partial response preserved instead of silently replacing it.\n"
+                                )
+                                full_response += _interrupted_note
+                                _interrupted_content, _interrupted_md = clean_thinking_for_save(
+                                    full_response,
+                                    {
+                                        "interrupted": True,
+                                        "partial_response_preserved": True,
+                                        "model": _actual_model or _answered_by or _requested_model,
+                                        "requested_model": _requested_model,
+                                        "session_id": session,
+                                        "turn_id": _turn_id,
+                                        "stream_id": _stream_id,
+                                        "provider_events": _provider_events,
+                                    },
+                                )
+                                sess.add_message(ChatMessage("assistant", _interrupted_content, metadata=_interrupted_md))
+                                if not incognito:
+                                    session_manager.save_sessions()
+                                yield f'data: {json.dumps({"delta": _interrupted_note, "type": "assistant_message_finalized", "interrupted": True, "session_id": session, "turn_id": _turn_id, "stream_id": _stream_id})}\n\n'
+                                yield f'data: {json.dumps({"type": "message_saved", "interrupted": True})}\n\n'
+                                _stream_set(session, status="error", partial=full_response)
                             yield chunk
                         elif chunk.startswith("event: "):
                             yield chunk
@@ -1056,7 +1156,12 @@ def setup_chat_routes(
                                     "model": _actual_model or _answered_by or _requested_model,
                                     "requested_model": _requested_model,
                                     "usage_source": "estimated",
+                                    "session_id": session,
+                                    "turn_id": _turn_id,
+                                    "stream_id": _stream_id,
                                 }
+                                if _provider_events:
+                                    last_metrics["provider_events"] = _provider_events
                                 yield f'data: {json.dumps({"type": "metrics", "data": last_metrics})}\n\n'
                             if full_response:
                                 _saved_id = save_assistant_response(
@@ -1134,6 +1239,8 @@ def setup_chat_routes(
                         tool_policy=tool_policy,
                         owner=_user,
                         fallbacks=_fallback_candidates,
+                        turn_id=_turn_id,
+                        stream_id=_stream_id,
                         plan_mode=plan_mode,
                         approved_plan=approved_plan or None,
                     ):
@@ -1172,7 +1279,15 @@ def setup_chat_routes(
                                     _answered_by = data.get("answered_by") or _answered_by
                                     _actual_model = _actual_model or _answered_by
                                     data["selected_model"] = data.get("selected_model") or _requested_model
-                                    yield chunk
+                                    _provider_events.append(dict(data))
+                                    _notice = _model_switch_notice(data, _requested_model)
+                                    full_response += _notice
+                                    _stream_set(session, partial=full_response)
+                                    yield f'data: {json.dumps({"delta": _notice, "type": "model_switch_visible_event", "model": _answered_by, "requested_model": _requested_model, "session_id": session, "turn_id": _turn_id, "stream_id": _stream_id})}\n\n'
+                                    yield f'data: {json.dumps(data)}\n\n'
+                                elif data.get("type") in _PROVIDER_RUNTIME_EVENTS:
+                                    _provider_events.append(dict(data))
+                                    yield f'data: {json.dumps(data)}\n\n'
                                 elif data.get("type") == "model_actual":
                                     _actual_model = data.get("model") or _actual_model
                                     data["requested_model"] = _requested_model
@@ -1182,10 +1297,51 @@ def setup_chat_routes(
                                     _reported_model = last_metrics.get("model")
                                     last_metrics["requested_model"] = last_metrics.get("requested_model") or _requested_model
                                     last_metrics["model"] = _reported_model or _actual_model or _answered_by or _requested_model
+                                    if _provider_events:
+                                        last_metrics["provider_events"] = _provider_events
+                                    last_metrics["session_id"] = session
+                                    last_metrics["turn_id"] = _turn_id
+                                    last_metrics["stream_id"] = _stream_id
                                     yield f'data: {json.dumps({"type": "metrics", "data": last_metrics})}\n\n'
                             except json.JSONDecodeError:
                                 yield chunk
                         elif chunk.startswith("event: "):
+                            if chunk.startswith("event: error"):
+                                _provider_events.append({
+                                    "type": "provider_stream_error",
+                                    "model": _actual_model or _answered_by or _requested_model,
+                                    "requested_model": _requested_model,
+                                    "session_id": session,
+                                    "turn_id": _turn_id,
+                                    "stream_id": _stream_id,
+                                    "error": _provider_error_text(chunk),
+                                    "partial_response_abandoned": bool(full_response),
+                                })
+                                if full_response:
+                                    _interrupted_note = (
+                                        "\n\nProvider stream disconnected before finalization. "
+                                        "Partial response preserved instead of silently replacing it.\n"
+                                    )
+                                    full_response += _interrupted_note
+                                    _interrupted_content, _interrupted_md = clean_thinking_for_save(
+                                        full_response,
+                                        {
+                                            "interrupted": True,
+                                            "partial_response_preserved": True,
+                                            "model": _actual_model or _answered_by or _requested_model,
+                                            "requested_model": _requested_model,
+                                            "session_id": session,
+                                            "turn_id": _turn_id,
+                                            "stream_id": _stream_id,
+                                            "provider_events": _provider_events,
+                                        },
+                                    )
+                                    sess.add_message(ChatMessage("assistant", _interrupted_content, metadata=_interrupted_md))
+                                    if not incognito:
+                                        session_manager.save_sessions()
+                                    yield f'data: {json.dumps({"delta": _interrupted_note, "type": "assistant_message_finalized", "interrupted": True, "session_id": session, "turn_id": _turn_id, "stream_id": _stream_id})}\n\n'
+                                    yield f'data: {json.dumps({"type": "message_saved", "interrupted": True})}\n\n'
+                                    _stream_set(session, status="error", partial=full_response)
                             yield chunk
                         elif chunk == "data: [DONE]\n\n":
                             if full_response:

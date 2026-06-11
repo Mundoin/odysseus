@@ -459,6 +459,20 @@ async def execute_tool_block(
     (bash, python) so the agent loop can emit `tool_progress` SSE
     events while the command is in flight. Ignored by other tools.
     """
+    # Runtime enforcement: while a browser safe-fill action is pending for
+    # this chat, model-driven raw fill/type tool calls are short-circuited —
+    # the canonical wrapper (browser_operator_safe_fill) owns execution.
+    try:
+        from src.form_fill_router import intercept_raw_fill_tool
+        _fill_intercept = intercept_raw_fill_tool(
+            block.tool_type, session_id=session_id, owner=owner
+        )
+    except Exception:
+        logger.exception("raw fill-tool interception check failed")
+        _fill_intercept = None
+    if _fill_intercept:
+        return f"{block.tool_type}: REDIRECTED to pending safe fill", _fill_intercept
+
     from src.tool_implementations import (
         do_create_document, do_update_document, do_edit_document,
         do_suggest_document, do_search_chats, do_manage_tasks,

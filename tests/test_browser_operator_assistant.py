@@ -47,8 +47,8 @@ def test_browser_mcp_prompt_includes_operator_workflow():
 
     assert "Browser operator workflow" in prompt
     assert "Summarize what you see" in prompt
-    assert "pending_confirmation" in prompt
-    assert "confirmed=true" in prompt
+    assert "do not need a second approval" in prompt
+    assert "preview/approval path only when the user explicitly asks" in prompt
 
 
 def test_browser_snapshot_result_formats_as_operator_observation():
