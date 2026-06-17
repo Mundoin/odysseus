@@ -8,10 +8,10 @@ Odysseus — self-hosted AI workspace. Local-first chat, agent with tools, model
 
 ## Commands
 
-**Start (Windows):**
-```powershell
-py -3.11 -m venv venv
-venv\Scripts\Activate.ps1
+**Start (Linux/macOS):**
+```bash
+python3 -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt
 python setup.py
 python -m uvicorn app:app --host 127.0.0.1 --port 7000

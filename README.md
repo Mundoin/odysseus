@@ -261,31 +261,23 @@ do not run on macOS. MLX-only models are not served by Odysseus.
 
 </details>
 
-### Native Windows
+### Native Linux / macOS
 
-**One-command launcher** (creates the venv, installs deps, runs setup, starts the
-server; safe to re-run):
+**One-command launcher** (creates the venv, installs deps, runs setup, starts
+the server; safe to re-run):
 
-```powershell
+```bash
 git clone https://github.com/pewdiepie-archdaemon/odysseus.git
 cd odysseus
-powershell -ExecutionPolicy Bypass -File .\launch-windows.ps1
-```
-
-Or do it by hand:
-
-```powershell
-git clone https://github.com/pewdiepie-archdaemon/odysseus.git
-cd odysseus
-py -3.11 -m venv venv
-venv\Scripts\Activate.ps1
+python3 -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt
 python setup.py
 python -m uvicorn app:app --host 127.0.0.1 --port 7000
 ```
 
-If `python` points at an older interpreter, use `py -3.12` (or another installed
-3.11+ version) for the venv step.
+If `python3` points at an older interpreter, use a 3.11+ install for the venv
+step.
 
 **Requirements:** Python 3.11+. The core app (chat, agent, memory, documents,
 email, calendar, deep research) runs fully native. For full **Cookbook** background
